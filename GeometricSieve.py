@@ -6,12 +6,54 @@ import random
 from functools import reduce
 
 class GeometricFactorizer:
-    def __init__(self, N, factor_base_size=50, precision_bits=100):
+    def __init__(self, N, factor_base_size=2000, precision_bits=100, interval_size=1000000):
         self.N = N
         self.precision_bits = precision_bits
+        self.interval_size = interval_size
         self.primes = self._generate_factor_base(factor_base_size)
         self.C = 1 << precision_bits  # Scaling factor for logarithms
         self.relations = [] # Store found relations (exponents vector)
+
+    def _tonelli_shanks(self, n, p):
+        """
+        Finds x such that x^2 = n (mod p).
+        """
+        if pow(n, (p - 1) // 2, p) != 1:
+            return []
+        
+        if p % 4 == 3:
+            return [pow(n, (p + 1) // 4, p)]
+        
+        s = 0
+        q = p - 1
+        while q % 2 == 0:
+            q //= 2
+            s += 1
+            
+        z = 2
+        while pow(z, (p - 1) // 2, p) != p - 1:
+            z += 1
+            
+        m = s
+        c = pow(z, q, p)
+        t = pow(n, q, p)
+        r = pow(n, (q + 1) // 2, p)
+        
+        while t != 0 and t != 1:
+            t2i = t
+            i = 0
+            for i in range(1, m):
+                t2i = (t2i * t2i) % p
+                if t2i == 1:
+                    break
+            
+            b = pow(c, 1 << (m - i - 1), p)
+            m = i
+            c = (b * b) % p
+            t = (t * c) % p
+            r = (r * b) % p
+            
+        return [r, p - r]
 
     def _generate_factor_base(self, size):
         primes = []
@@ -48,7 +90,7 @@ class GeometricFactorizer:
         
         # Sieve Interval
         start_x = math.isqrt(self.N) + 1
-        interval_size = 200000
+        interval_size = self.interval_size
         sieve_array = [0] * interval_size
         
         # Initialize sieve array with x^2 - N
@@ -62,16 +104,7 @@ class GeometricFactorizer:
         print("Sieving...")
         for p in self.primes:
             # Solve x^2 = N mod p
-            # We need modular square root
-            if pow(self.N, (p - 1) // 2, p) != 1:
-                continue
-                
-            # Tonelli-Shanks or simple search for small p
-            # Since p is small (factor base), simple search is fine
-            roots = []
-            for r in range(p):
-                if (r * r) % p == (self.N % p):
-                    roots.append(r)
+            roots = self._tonelli_shanks(self.N, p)
             
             for r in roots:
                 # Find first index i such that (start_x + i) = r mod p
@@ -253,6 +286,7 @@ if __name__ == "__main__":
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
     # Larger factor base for better chance of smoothness
-    factorizer = GeometricFactorizer(N, factor_base_size=300, precision_bits=120)
+    # Updated parameters for larger N
+    factorizer = GeometricFactorizer(N, factor_base_size=1000, precision_bits=120, interval_size=1000000)
     factorizer.find_relations()
     factorizer.solve_linear_system()
