@@ -6,6 +6,29 @@ import random
 from functools import reduce
 from decimal import Decimal, getcontext
 
+def jacobi_symbol(a, n):
+    """
+    Calculates the Jacobi symbol (a/n).
+    n must be a positive odd integer.
+    """
+    if n <= 0: return 0
+    if n % 2 == 0: return 0
+    a %= n
+    result = 1
+    while a != 0:
+        while a % 2 == 0:
+            a //= 2
+            if n % 8 in (3, 5):
+                result = -result
+        a, n = n, a
+        if a % 4 == 3 and n % 4 == 3:
+            result = -result
+        a %= n
+    if n == 1:
+        return result
+    else:
+        return 0
+
 class GeometricFactorizer:
     def __init__(self, N, factor_base_size=None, precision_bits=None, interval_size=None, lattice_dim=500):
         self.N = N
@@ -257,8 +280,11 @@ class GeometricFactorizer:
                     })
                     pass_relations += 1
                 
-                elif isPrime(abs(remainder)):
-                    # Large Prime Relation
+                elif jacobi_symbol(self.N, abs(remainder)) == 1:
+                    # Partial Relation (Large Prime or Composite)
+                    # We don't strictly need the remainder to be prime to combine it!
+                    # If we find two relations with the SAME remainder R, we can multiply them
+                    # to get R^2, which is a square.
                     lp = abs(remainder)
                     
                     # Construct rel_vec (same as for full relation)
@@ -278,22 +304,13 @@ class GeometricFactorizer:
                     # Normalize sign
                     rel_vec[0] = rel_vec[0] % 2
                     
-                    if lp in self.partial_relations:
-                        # Combine!
-                        match_vec = self.partial_relations[lp]
-                        # Sum vectors
-                        combined_vec = [v1 + v2 for v1, v2 in zip(rel_vec, match_vec)]
-                        # Normalize sign
-                        combined_vec[0] = combined_vec[0] % 2
-                        
-                        self.relations.append({
-                            'x': 1,
-                            'exponents': combined_vec
-                        })
-                        pass_relations += 1
-                        del self.partial_relations[lp]
-                    else:
-                        self.partial_relations[lp] = rel_vec
+                    # Store as partial relation with remainder
+                    self.relations.append({
+                        'x': 1,
+                        'exponents': rel_vec,
+                        'remainder': lp
+                    })
+                    pass_relations += 1
             
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
             
@@ -348,10 +365,11 @@ class GeometricFactorizer:
                     temp //= p
                 if temp == 1: break
             
-            if temp == 1:
+            if temp == 1 or jacobi_symbol(self.N, abs(temp)) == 1:
                 self.relations.append({
                     'x': x,
-                    'd_exponents': d_exponents
+                    'd_exponents': d_exponents,
+                    'remainder': abs(temp)
                 })
                 found += 1
                 if found >= needed:
@@ -375,21 +393,48 @@ class GeometricFactorizer:
         # Build Matrix M (relations x primes)
         # We only care about exponents mod 2
         
+        # Identify all extra factors (remainders)
+        extra_factors = set()
+        for rel in self.relations:
+            r = rel.get('remainder', 1)
+            if r != 1:
+                extra_factors.add(r)
+        
+        sorted_extras = sorted(list(extra_factors))
+        extra_map = {val: i for i, val in enumerate(sorted_extras)}
+        
+        num_base_cols = len(self.primes) + 1 # +1 for -1
+        total_cols = num_base_cols + len(sorted_extras)
+        
+        print(f"  Matrix size: {len(self.relations)} x {total_cols} (Base: {num_base_cols}, Extra: {len(sorted_extras)})")
+
         M = []
         for rel in self.relations:
+            row = [0] * total_cols
+            
             # Use 'exponents' if available (new format), else 'd_exponents' (old format/sieve)
             if 'exponents' in rel:
                 # New format: exponents includes -1 at index 0
                 # We need to map this to the matrix columns
                 # Matrix columns: [-1, p1, p2, ..., pd]
                 # rel['exponents'] is exactly this!
-                row = [abs(x) % 2 for x in rel['exponents']]
+                for i, e in enumerate(rel['exponents']):
+                    row[i] = abs(e) % 2
             elif 'd_exponents' in rel:
                 # Old format: d_exponents corresponds to primes only
-                # Prepend 0 for -1
-                row = [0] + [x % 2 for x in rel['d_exponents']]
+                # Prepend 0 for -1 (sieve relations are squares, so positive)
+                row[0] = 0
+                for i, e in enumerate(rel['d_exponents']):
+                    row[i+1] = e % 2
             else:
                 continue
+            
+            # Handle extra factor
+            r = rel.get('remainder', 1)
+            if r != 1:
+                idx = num_base_cols + extra_map[r]
+                row[idx] = 1
+                
             M.append(row)
             
         # Gaussian Elimination to find Kernel Basis
@@ -504,6 +549,10 @@ class GeometricFactorizer:
             # Size is d+1
             Y_exponents = [0] * (len(self.primes) + 1)
             
+            # Also track extra factors (remainders)
+            # We need to ensure they are all even too
+            Y_extra_factors = {}
+            
             for idx in indices:
                 rel = self.relations[idx]
                 X = (X * rel['x']) % self.N
@@ -515,6 +564,11 @@ class GeometricFactorizer:
                     # Fallback for sieve relations (assumed positive, no -1)
                     for i, e in enumerate(rel['d_exponents']):
                         Y_exponents[i+1] += e
+                
+                # Handle extra factor
+                rem = rel.get('remainder', 1)
+                if rem != 1:
+                    Y_extra_factors[rem] = Y_extra_factors.get(rem, 0) + 1
             
             # Compute Y = product(p^(exp/2)) mod N
             Y = 1
@@ -526,6 +580,14 @@ class GeometricFactorizer:
             else:
                 # (-1)^(2k) = 1, so we ignore it for Y
                 pass
+            
+            # Handle extra factors
+            for rem, count in Y_extra_factors.items():
+                if count % 2 != 0:
+                    valid = False
+                    break
+                # Add to Y: rem^(count/2)
+                Y = (Y * pow(rem, count // 2, self.N)) % self.N
                 
             if not valid: continue
 
@@ -579,13 +641,25 @@ class GeometricFactorizer:
                                 if e > 0: r_pos *= pow(self.primes[i], e)
                                 elif e < 0: r_neg *= pow(self.primes[i], -e)
                             
+                            # Handle extra factor (remainder)
+                            rem = rel.get('remainder', 1)
+                            if rem != 1:
+                                # Remainder is on the RHS (factor side)
+                                r_pos *= rem
+                            
                             if r_pos % self.N != r_neg % self.N:
                                 print(f"      [BAD RELATION] Index {idx} is invalid! {r_pos%self.N} != {r_neg%self.N}")
                         elif 'd_exponents' in rel:
-                            # Sieve relation: x^2 = prod p^e
+                            # Sieve relation: x^2 = prod p^e * remainder
                             rhs = 1
                             for i, e in enumerate(rel['d_exponents']):
                                 rhs *= pow(self.primes[i], e)
+                            
+                            # Handle extra factor
+                            rem = rel.get('remainder', 1)
+                            if rem != 1:
+                                rhs *= rem
+                                
                             lhs = pow(rel['x'], 2)
                             if lhs % self.N != rhs % self.N:
                                 print(f"      [BAD RELATION] Sieve Index {idx} is invalid!")
