@@ -2,6 +2,7 @@ import numpy as np
 from Crypto.Util.number import getPrime, isPrime, GCD
 from geometric_lll import GeometricLLL
 import math
+import random
 from functools import reduce
 
 class GeometricFactorizer:
@@ -42,221 +43,81 @@ class GeometricFactorizer:
         return B
 
     def find_relations(self):
-        print(f"Building Schnorr Lattice for N={self.N}...")
+        print(f"Starting Quadratic Sieve Relation Finding for N={self.N}...")
         print(f"Factor Base Size: {len(self.primes)}")
         
-        basis = self.build_schnorr_lattice()
+        # Sieve Interval
+        start_x = math.isqrt(self.N) + 1
+        interval_size = 200000
+        sieve_array = [0] * interval_size
         
-        print("Running GeometricLLL Reduction...")
-        glll = GeometricLLL(N=self.N, p=1, q=1, basis=basis)
-        reduced_basis = glll.run_geometric_reduction(verbose=True)
-        
-        print("\nAnalyzing Reduced Vectors for Relations...")
-        
-        # Check each vector in the reduced basis
-        for i, vec in enumerate(reduced_basis):
-            exponents = vec[:len(self.primes)]
+        # Initialize sieve array with x^2 - N
+        print("Initializing sieve array...")
+        for i in range(interval_size):
+            x = start_x + i
+            val = x * x - self.N
+            sieve_array[i] = val
             
-            # Calculate the product from exponents
-            u = 1
-            v = 1
+        # Sieve with factor base
+        print("Sieving...")
+        for p in self.primes:
+            # Solve x^2 = N mod p
+            # We need modular square root
+            if pow(self.N, (p - 1) // 2, p) != 1:
+                continue
+                
+            # Tonelli-Shanks or simple search for small p
+            # Since p is small (factor base), simple search is fine
+            roots = []
+            for r in range(p):
+                if (r * r) % p == (self.N % p):
+                    roots.append(r)
             
-            # Reconstruct the relation u/v * N^x_N approx 1
-            # We need to find x_N
-            current_sum = sum(vec[j] * int(round(self.C * math.log(self.primes[j]))) for j in range(len(self.primes)))
-            weight_N = int(round(self.C * math.log(self.N)))
-            
-            d_idx = len(self.primes)
-            remainder = vec[d_idx] - current_sum
-            if weight_N == 0: continue
-            
-            x_N_float = remainder / weight_N
-            
-            if abs(x_N_float - round(x_N_float)) < 0.001:
-                x_N = int(round(x_N_float))
+            for r in roots:
+                # Find first index i such that (start_x + i) = r mod p
+                # start_x + i = r (mod p) => i = r - start_x (mod p)
+                first_i = (r - start_x) % p
                 
-                # Calculate u and v
-                # Relation is: product(p_i ^ e_i) * N^x_N = 1 + error
-                # So product(p_i ^ e_i) = N^(-x_N) + error
-                # We want: X^2 = Y^2 mod N
+                # Sieve
+                for i in range(first_i, interval_size, p):
+                    while sieve_array[i] % p == 0:
+                        sieve_array[i] //= p
+                        
+        # Collect relations
+        print("Collecting relations...")
+        for i in range(interval_size):
+            if sieve_array[i] == 1:
+                # Smooth!
+                x = start_x + i
+                val = x * x - self.N
                 
-                # Let's store the exponent vector for the primes
-                # We only care about the exponents modulo 2 for the linear algebra step
-                # But we need the full exponents to construct the square root later
+                # Factor val to get exponents
+                d_exponents = [0] * len(self.primes)
+                temp = val
+                for p_idx, p in enumerate(self.primes):
+                    while temp % p == 0:
+                        d_exponents[p_idx] += 1
+                        temp //= p
                 
-                # We are looking for product(p_i ^ e_i) = smooth mod N
-                # In this lattice, we find u * N^k approx v
-                # So u * N^k - v = small_error
-                # This means u * N^k = v + small_error
-                # If small_error is 0, then u * N^k = v. This is trivial if k=0 and u=v.
+                self.relations.append({
+                    'x': x,
+                    'd_exponents': d_exponents
+                })
                 
-                # Schnorr's method looks for |u - v*N| < something small
-                # Here we have u * N^x_N approx v
-                
-                # Let's check if u * N^x_N - v is 0 mod N? No.
-                # We want X^2 = Y^2 mod N.
-                
-                # Let's just collect the exponent vectors.
-                # If we find a dependency sum(vec_k) = 0 mod 2 (for all components),
-                # Then product(relation_k) will have all even exponents.
-                # So product(relation_k) = (Something)^2
-                
-                # The relation is: product(p_i ^ e_i) * N^x_N approx 1
-                # This implies product(p_i ^ e_i) is close to a power of N.
-                # This isn't exactly X^2 = Y^2 mod N directly.
-                
-                # Standard Schnorr:
-                # Find (e_1, ..., e_d) such that | sum e_i ln p_i - ln N | is small.
-                # Then U = product p_i^e_i is close to N.
-                # So U - N = small_residue.
-                # If small_residue is smooth (factors over factor base), we have a relation:
-                # U = N + smooth
-                # U = smooth (mod N)
-                # product p_i^e_i = product p_j^f_j (mod N)
-                
-                # Let's try to interpret the vector as U = product p_i^e_i
-                # If e_i can be negative, we have U/V approx N.
-                # U approx V * N.
-                # U - V*N = delta.
-                # U = delta (mod N).
-                # If delta is smooth, we have U = delta (mod N).
-                # U is smooth (by definition). Delta is smooth (hopefully).
-                # So we have Smooth1 = Smooth2 (mod N).
-                # This is a relation!
-                
-                # Calculate U and V from positive/negative exponents
-                U = 1
-                V = 1
-                for j, exp in enumerate(exponents):
-                    if exp > 0:
-                        U *= self.primes[j] ** int(exp)
-                    elif exp < 0:
-                        V *= self.primes[j] ** int(-exp)
-                
-                # We have U * N^x_N approx V
-                # Let's assume x_N is typically -1 or 1 for simple relations
-                # Case 1: U approx V * N  => U - V*N = delta
-                # Case 2: U * N approx V  => V - U*N = delta
-                
-                # Let's calculate the exact integer difference
-                # We treat N^x_N term carefully
-                
-                lhs = U * (self.N ** x_N) if x_N > 0 else U
-                rhs = V * (self.N ** (-x_N)) if x_N < 0 else V
-                
-                # diff = lhs - rhs
-                # We want lhs = rhs (mod N) -> this is always true if diff is a multiple of N?
-                # No, we want lhs = rhs + delta, where delta is small.
-                # Then lhs = delta (mod N) (if rhs is multiple of N? No)
-                
-                # Wait, the relation we want is X^2 = Y^2 mod N.
-                # We build this by multiplying many relations of the form:
-                # A_k = B_k mod N
-                # where A_k and B_k are smooth.
-                
-                # In our case:
-                # lhs - rhs = delta
-                # lhs = rhs + delta
-                # lhs = delta (mod N)  (If rhs is a multiple of N? No, rhs is smooth V)
-                # lhs = V + delta
-                # lhs - V = delta
-                # U * N^k - V = delta
-                # U * N^k = V + delta
-                # Modulo N:
-                # If k > 0: 0 = V + delta => V = -delta (mod N)
-                # If k = 0: U = V + delta => U - V = delta (mod N)
-                # If k < 0: U = V*N^(-k) + delta => U*N^k = V + delta
-                
-                # Let's look for the case where x_N = 0.
-                # Then U approx V. U - V = delta.
-                # U = V + delta.
-                # U - V = delta.
-                # If delta is smooth, we have U/V = delta (mod N)? No.
-                
-                # Let's look for the case where x_N = 1.
-                # U * N approx V.
-                # U * N - V = delta.
-                # -V = delta (mod N).
-                # V = -delta (mod N).
-                # V is smooth. If delta is smooth, we have Smooth1 = Smooth2 (mod N).
-                
-                # Let's calculate delta
-                delta = lhs - rhs
-                
-                # Check if delta is B-smooth (factors over our prime base)
-                if delta == 0: continue
-                
-                delta_abs = abs(delta)
-                
-                # Factor delta over our factor base
-                delta_exponents = [0] * len(self.primes)
-                temp_delta = delta_abs
-                
-                is_smooth = True
-                for p_idx, p_val in enumerate(self.primes):
-                    while temp_delta % p_val == 0:
-                        delta_exponents[p_idx] += 1
-                        temp_delta //= p_val
-                
-                if temp_delta == 1:
-                    # Delta is smooth!
-                    # We have a relation:
-                    # If x_N = 1: V = -delta (mod N)
-                    # V is product(p_i ^ v_i)
-                    # delta is product(p_i ^ d_i) * (-1 if delta<0)
-                    # So product(p_i ^ v_i) = -1 * product(p_i ^ d_i) (mod N)
-                    # This is a relation between smooth numbers!
-                    
-                    # Combine exponents:
-                    # V_exponents - Delta_exponents (mod 2)
-                    
-                    # Let's construct the full exponent vector for this relation
-                    # The relation is of the form: product(p_i ^ total_exp_i) = +/- 1 mod N
-                    
-                    # If x_N = 1:
-                    # V = -delta (mod N)
-                    # V * delta^-1 = -1 (mod N)
-                    # product(p_i ^ v_i) * product(p_i ^ -d_i) = -1 (mod N)
-                    # total_exp_i = v_i - d_i
-                    
-                    # We need to handle the -1. We can treat -1 as a "prime" at index -1.
-                    # But for now let's just store the exponent vector.
-                    
-                    # V exponents come from 'vec' where exp < 0
-                    v_exponents = [(-x if x < 0 else 0) for x in exponents]
-                    
-                    # Total exponents for the relation X = +/- 1 mod N
-                    # X = V / delta = V * delta^-1
-                    # exp_i = v_exponents[i] - delta_exponents[i]
-                    
-                    final_exponents = [v_exponents[k] - delta_exponents[k] for k in range(len(self.primes))]
-                    
-                    # Also track the sign of delta
-                    sign = -1 if delta < 0 else 1
-                    # If x_N = 1, we have V = -delta => V/delta = -1.
-                    # If delta < 0, V/(-|delta|) = -1 => V/|delta| = 1.
-                    # If delta > 0, V/|delta| = -1.
-                    
-                    # We want X^2 = 1 mod N.
-                    # We will multiply many relations to get even exponents and +1 sign.
-                    
-                    print(f"  [+] Found Smooth Relation! Delta={delta}")
-                    self.relations.append({
-                        'exponents': final_exponents,
-                        'sign': -1 if (delta > 0) else 1 # If delta>0, ratio is -1. If delta<0, ratio is 1.
-                    })
+        print(f"Found {len(self.relations)} smooth relations.")
 
     def solve_linear_system(self):
         print(f"\nSolving Linear System with {len(self.relations)} relations...")
-        if len(self.relations) < len(self.primes):
+        if len(self.relations) < len(self.primes) + 5:
             print("Not enough relations to guarantee a solution.")
             return
 
         # Build Matrix M (relations x primes)
-        # Include sign column at the start
+        # We only care about d_exponents mod 2
+        
         M = []
         for rel in self.relations:
-            row = [1 if rel['sign'] == -1 else 0] + [x % 2 for x in rel['exponents']]
+            row = [x % 2 for x in rel['d_exponents']]
             M.append(row)
             
         # Gaussian Elimination to find Kernel Basis
@@ -273,7 +134,6 @@ class GeometricFactorizer:
             
         pivot_row = 0
         col = 0
-        pivots = []
         
         while pivot_row < num_rows and col < num_cols:
             pivot_idx = -1
@@ -293,12 +153,10 @@ class GeometricFactorizer:
                     for j in range(col, len(augmented[0])):
                         augmented[i][j] ^= augmented[pivot_row][j]
             
-            pivots.append(col)
             pivot_row += 1
             col += 1
             
         # Collect Basis Vectors of the Kernel
-        # Any row in the M part that is all zeros represents a dependency
         kernel_basis = []
         for i in range(num_rows):
             is_zero = True
@@ -318,15 +176,14 @@ class GeometricFactorizer:
         # Randomized Search for Non-Trivial Factors
         import random
         attempts = 0
-        max_attempts = 20
+        max_attempts = 100
         
-        print(f"  Attempting to combine dependencies to filter trivials...")
+        print(f"  Attempting to combine dependencies to find X^2 = Y^2 with X != +/-Y...")
         
         while attempts < max_attempts:
             attempts += 1
             
             # Pick a random non-empty subset of the kernel basis
-            # This generates a random element of the null space
             if len(kernel_basis) > 0:
                 mask = [random.randint(0, 1) for _ in range(len(kernel_basis))]
                 if sum(mask) == 0: mask[0] = 1
@@ -343,27 +200,39 @@ class GeometricFactorizer:
             indices = [k for k, bit in enumerate(combined_dependency) if bit == 1]
             if not indices: continue
             
-            # Construct X
-            X_exponents = [0] * len(self.primes)
+            # Construct X (product of x_i) and Y (sqrt of product of y_i)
+            X = 1
+            Y_exponents = [0] * len(self.primes)
+            
             for idx in indices:
                 rel = self.relations[idx]
-                for p_idx, exp in enumerate(rel['exponents']):
-                    X_exponents[p_idx] += exp
+                X = (X * rel['x']) % self.N
+                for p_idx in range(len(self.primes)):
+                    Y_exponents[p_idx] += rel['d_exponents'][p_idx]
             
-            # Compute X
-            X = 1
-            for p_idx, total_exp in enumerate(X_exponents):
-                half_exp = total_exp // 2
-                term = pow(self.primes[p_idx], half_exp, self.N)
-                X = (X * term) % self.N
+            # Compute Y = product(p^(exp/2)) mod N
+            Y = 1
+            valid = True
+            
+            for p_idx in range(len(self.primes)):
+                if Y_exponents[p_idx] % 2 != 0:
+                    valid = False
+                    break
+                    
+                y_half = Y_exponents[p_idx] // 2
+                Y = (Y * pow(self.primes[p_idx], y_half, self.N)) % self.N
+            
+            if not valid: continue
                 
-            if X == 1 or X == self.N - 1:
+            # Now X^2 = Y^2 mod N
+            # Check if X != +/- Y
+            if X == Y or X == (self.N - Y) % self.N:
                 # Trivial
                 continue
                 
-            # Check Factors
-            f1 = GCD(X - 1, self.N)
-            f2 = GCD(X + 1, self.N)
+            # Check Factors: gcd(X - Y, N)
+            f1 = GCD((X - Y) % self.N, self.N)
+            f2 = GCD((X + Y) % self.N, self.N)
             
             if f1 > 1 and f1 < self.N:
                 print(f"\n[SUCCESS] Factor found: {f1}")
@@ -384,6 +253,6 @@ if __name__ == "__main__":
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
     # Larger factor base for better chance of smoothness
-    factorizer = GeometricFactorizer(N, factor_base_size=100, precision_bits=120)
+    factorizer = GeometricFactorizer(N, factor_base_size=300, precision_bits=120)
     factorizer.find_relations()
     factorizer.solve_linear_system()
