@@ -293,40 +293,69 @@ class GeometricFactorizer:
                     pass_relations += 1
                 
                 elif jacobi_symbol(self.N, abs(remainder)) == 1:
-                    # Partial Relation (Large Prime or Composite)
-                    # We don't strictly need the remainder to be prime to combine it!
-                    # If we find two relations with the SAME remainder R, we can multiply them
-                    # to get R^2, which is a square.
+                    # Large Prime Variation: Only accept if we've seen this remainder before
+                    # This ensures each extra factor column has at least 2 relations
                     lp = abs(remainder)
                     
-                    # Construct rel_vec (same as for full relation)
-                    rel_vec = [0] * (d + 1)
-                    X_val = 1
-                    
-                    if e_N > 0:
-                        X_val = neg_product % self.N
-                        for i, e in enumerate(exponents):
-                            if e < 0: rel_vec[i+1] += -e
-                        for i in range(d + 1):
-                            rel_vec[i] -= delta_exps[i]
-                        rel_vec[0] -= 1 
+                    # Check if we already have a relation with this remainder
+                    if lp not in self.partial_relations:
+                        # Store for later - don't add to relations yet
+                        rel_vec = [0] * (d + 1)
+                        X_val = 1
+                        
+                        if e_N > 0:
+                            X_val = neg_product % self.N
+                            for i, e in enumerate(exponents):
+                                if e < 0: rel_vec[i+1] += -e
+                            for i in range(d + 1):
+                                rel_vec[i] -= delta_exps[i]
+                            rel_vec[0] -= 1 
+                        else:
+                            X_val = pos_product % self.N
+                            for i, e in enumerate(exponents):
+                                if e > 0: rel_vec[i+1] += e
+                            for i in range(d + 1):
+                                rel_vec[i] -= delta_exps[i]
+                        
+                        rel_vec[0] = rel_vec[0] % 2
+                        
+                        self.partial_relations[lp] = {
+                            'x': X_val,
+                            'exponents': rel_vec,
+                            'remainder': lp
+                        }
                     else:
-                        X_val = pos_product % self.N
-                        for i, e in enumerate(exponents):
-                            if e > 0: rel_vec[i+1] += e
-                        for i in range(d + 1):
-                            rel_vec[i] -= delta_exps[i]
-                    
-                    # Normalize sign
-                    rel_vec[0] = rel_vec[0] % 2
-                    
-                    # Store as partial relation with remainder
-                    self.relations.append({
-                        'x': X_val,
-                        'exponents': rel_vec,
-                        'remainder': lp
-                    })
-                    pass_relations += 1
+                        # We have a match! Add both relations
+                        rel_vec = [0] * (d + 1)
+                        X_val = 1
+                        
+                        if e_N > 0:
+                            X_val = neg_product % self.N
+                            for i, e in enumerate(exponents):
+                                if e < 0: rel_vec[i+1] += -e
+                            for i in range(d + 1):
+                                rel_vec[i] -= delta_exps[i]
+                            rel_vec[0] -= 1 
+                        else:
+                            X_val = pos_product % self.N
+                            for i, e in enumerate(exponents):
+                                if e > 0: rel_vec[i+1] += e
+                            for i in range(d + 1):
+                                rel_vec[i] -= delta_exps[i]
+                        
+                        rel_vec[0] = rel_vec[0] % 2
+                        
+                        # Add the stored relation first (if not already added)
+                        stored = self.partial_relations.pop(lp)
+                        self.relations.append(stored)
+                        
+                        # Add the new relation
+                        self.relations.append({
+                            'x': X_val,
+                            'exponents': rel_vec,
+                            'remainder': lp
+                        })
+                        pass_relations += 2
             
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
             
@@ -381,15 +410,36 @@ class GeometricFactorizer:
                     temp //= p
                 if temp == 1: break
             
-            if temp == 1 or jacobi_symbol(self.N, abs(temp)) == 1:
+            if temp == 1:
+                # Full relation - add directly
                 self.relations.append({
                     'x': x,
                     'd_exponents': d_exponents,
-                    'remainder': abs(temp)
+                    'remainder': 1
                 })
                 found += 1
-                if found >= needed:
-                    break
+            elif jacobi_symbol(self.N, abs(temp)) == 1:
+                # Partial relation - use Large Prime Variation
+                lp = abs(temp)
+                if lp in self.partial_relations:
+                    # Match found! Add both
+                    self.relations.append(self.partial_relations.pop(lp))
+                    self.relations.append({
+                        'x': x,
+                        'd_exponents': d_exponents,
+                        'remainder': lp
+                    })
+                    found += 2
+                else:
+                    # Store for later
+                    self.partial_relations[lp] = {
+                        'x': x,
+                        'd_exponents': d_exponents,
+                        'remainder': lp
+                    }
+            
+            if found >= needed:
+                break
         
         print(f"  Supplementary sieve found {found} additional relations.")
 
