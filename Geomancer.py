@@ -823,13 +823,22 @@ class GeometricFactorizer:
                 continue
                 
             # Check Factors: gcd(X - Y, N)
-            f1 = GCD((X - Y) % self.N, self.N)
-            f2 = GCD((X + Y) % self.N, self.N)
+            val1 = (X - Y) % self.N
+            val2 = (X + Y) % self.N
+            f1 = math.gcd(val1, self.N)
+            f2 = math.gcd(val2, self.N)
             
             if attempt < 5:
-                print(f"    Debug: Non-trivial candidate! X={X}, Y={Y}")
-                print(f"    gcd(X-Y, N) = {f1}")
-                print(f"    gcd(X+Y, N) = {f2}")
+                print(f"    Debug: Non-trivial candidate! X={X}")
+                # print(f"    Y={Y}") # Y is too long
+                print(f"    X^2 mod N = {X2}")
+                print(f"    Y^2 mod N = {Y2}")
+                print(f"    val1 = (X-Y)%N = {val1}")
+                print(f"    val2 = (X+Y)%N = {val2}")
+                print(f"    gcd(val1, N) = {f1}")
+                print(f"    gcd(val2, N) = {f2}")
+                # print(f"    N = {self.N}")
+                # print(f"    (val1 * val2) % N = {(val1 * val2) % self.N}")
             
             if f1 > 1 and f1 < self.N:
                 print(f"\n[SUCCESS] Factor found: {f1}")
