@@ -8,6 +8,8 @@ Geomancer is a powerful integer factorization tool that successfully factors **R
 
 ## 🏆 Results
 
+Note that it won't outright factor every key... yet.
+
 | RSA Size | Lattice Dimension | Status |
 |----------|-------------------|--------|
 | RSA-512  | 200×200          | ✅ Factored |
