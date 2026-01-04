@@ -1,8 +1,10 @@
 import numpy as np
 from Crypto.Util.number import getPrime, isPrime, GCD
 from geometric_lll import GeometricLLL
+from RelationTransformer import RelationTransformer
 import math
 import random
+import copy
 from functools import reduce
 from decimal import Decimal, getcontext
 
@@ -183,6 +185,9 @@ class GeometricFactorizer:
         
         seen_relations = set()
         
+        # Store successful coefficients for training the Transformer
+        self.successful_coeffs = []
+        
         max_passes = 20
         
         for pass_num in range(max_passes):
@@ -215,22 +220,20 @@ class GeometricFactorizer:
             print("Analyzing reduced basis for relations...")
             
             pass_relations = 0
-            for row in reduced:
-                exponents = [int(row[i]) for i in range(d)]
-                weight = int(row[d])
+            
+            # Helper to process a vector of exponents
+            def process_vector(exponents, coeffs_record=None, basis_snapshot=None):
+                nonlocal pass_relations
                 
-                if all(e == 0 for e in exponents): continue
+                if all(e == 0 for e in exponents): return
                 
                 # Reconstruct e_N
                 sum_log = sum(e * lp for e, lp in zip(exponents, log_primes))
                 e_N = -int(round(sum_log / log_N))
                 
-                if e_N == 0: continue 
+                if e_N == 0: return 
                 
                 # Calculate delta
-                # If e_N > 0: U * N^e_N - V = delta
-                # If e_N < 0: U - V * N^(-e_N) = delta
-                
                 pos_product = 1
                 neg_product = 1
                 for i, e in enumerate(exponents):
@@ -243,7 +246,7 @@ class GeometricFactorizer:
                 else:
                     delta = pos_product - neg_product * pow(self.N, -e_N)
                 
-                if delta == 0: continue
+                if delta == 0: return
 
                 # Factor delta
                 delta_exps, remainder = self._factor_over_base(delta, self.primes)
@@ -291,6 +294,8 @@ class GeometricFactorizer:
                         'exponents': rel_vec
                     })
                     pass_relations += 1
+                    if coeffs_record is not None and basis_snapshot is not None:
+                        self.successful_coeffs.append((basis_snapshot, coeffs_record))
                 
                 elif jacobi_symbol(self.N, abs(remainder)) == 1:
                     # Large Prime Variation: Only accept if we've seen this remainder before
@@ -356,6 +361,41 @@ class GeometricFactorizer:
                             'remainder': lp
                         })
                         pass_relations += 2
+                        if coeffs_record is not None and basis_snapshot is not None:
+                            self.successful_coeffs.append((basis_snapshot, coeffs_record))
+
+            # 1. Check basis vectors
+            basis_vectors = []
+            reduced_snapshot = copy.deepcopy(reduced)
+            for r_idx, row in enumerate(reduced):
+                vec = [int(row[i]) for i in range(d)]
+                basis_vectors.append(vec)
+                
+                # Record coeffs: just 1 at r_idx
+                coeffs = np.zeros(dim)
+                coeffs[r_idx] = 1
+                
+                process_vector(vec, coeffs, reduced_snapshot)
+            
+            # 2. Lattice Sieving: Check random linear combinations
+            # This generates many more short vectors from the reduced basis
+            print(f"    Sieving lattice (checking 2000 combinations)...")
+            for _ in range(2000):
+                # Pick 2-3 vectors
+                k = random.randint(2, 3)
+                indices = random.sample(range(len(basis_vectors)), k)
+                
+                # Combine
+                new_vec = [0] * d
+                coeffs = np.zeros(dim)
+                
+                for idx in indices:
+                    coeff = random.choice([-1, 1])
+                    coeffs[idx] = coeff
+                    for i in range(d):
+                        new_vec[i] += coeff * basis_vectors[idx][i]
+                
+                process_vector(new_vec, coeffs, reduced_snapshot)
             
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
             
@@ -367,6 +407,43 @@ class GeometricFactorizer:
                 break
         
         print(f"Found {len(self.relations)} relations from LLL passes.")
+        
+        # --- Transformer Learning & Divining ---
+        if len(self.successful_coeffs) > 0:
+            print(f"\nTraining Transformer on {len(self.successful_coeffs)} successful patterns...")
+            # Initialize model
+            # input_dim is d + 1 (dimension of lattice vectors)
+            model = RelationTransformer(d + 1, model_dim=64, num_heads=4, num_layers=2)
+            
+            # Train on collected data
+            for i, (basis, coeffs) in enumerate(self.successful_coeffs):
+                basis_mat = np.array(basis, dtype=np.float64)
+                model.train(basis_mat, [coeffs], iterations=20)
+                if (i+1) % 10 == 0:
+                    print(f"  Trained on {i+1}/{len(self.successful_coeffs)} samples")
+            
+            print("Divining new relations with Transformer...")
+            # Use the FINAL reduced basis from the last pass
+            final_basis = np.array(reduced, dtype=np.float64)
+            
+            for _ in range(100): 
+                pred_coeffs = model.divine_coefficients(final_basis)
+                
+                new_vec = [0] * d
+                is_zero = True
+                for i in range(d):
+                    if pred_coeffs[i] != 0:
+                        is_zero = False
+                        for j in range(d):
+                            new_vec[j] += pred_coeffs[i] * final_basis[i][j]
+                
+                if not is_zero:
+                    # Convert to integers
+                    new_vec = [int(round(x)) for x in new_vec]
+                    process_vector(new_vec, None, None)
+            
+            print(f"Transformer phase complete.")
+        # ---------------------------------------
         
         # If LLL alone didn't find enough, do a targeted sieve
         if len(self.relations) < target_relations:
@@ -654,7 +731,7 @@ class GeometricFactorizer:
                     break
                 # Add to Y: rem^(count/2)
                 Y = (Y * pow(rem, count // 2, self.N)) % self.N
-                
+            
             if not valid: continue
 
             # Handle primes (indices 1 to d)
