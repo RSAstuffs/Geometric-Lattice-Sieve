@@ -295,8 +295,6 @@ class GeometricFactorizer:
     def solve_linear_system(self):
         print(f"\nSolving Linear System with {len(self.relations)} relations...")
         
-        # We can still try even if we have fewer relations than primes
-        # The probability of finding a dependency is lower but not zero
         if len(self.relations) < 10:
             print("Too few relations to attempt solution.")
             return
@@ -305,9 +303,7 @@ class GeometricFactorizer:
             print(f"Warning: Have {len(self.relations)} relations but {len(self.primes)} primes.")
             print("Attempting anyway - may still find dependencies...")
 
-        # Build Matrix M (relations x primes)
-        # We only care about d_exponents mod 2
-        
+        # Build Matrix M (relations x primes) over GF(2)
         M = []
         for rel in self.relations:
             row = [x % 2 for x in rel['d_exponents']]
@@ -317,6 +313,8 @@ class GeometricFactorizer:
         matrix = [row[:] for row in M]
         num_rows = len(matrix)
         num_cols = len(matrix[0])
+        
+        print(f"  Building {num_rows}x{num_cols} matrix over GF(2)...")
         
         # Augmented with Identity to track combinations
         augmented = []
@@ -366,77 +364,104 @@ class GeometricFactorizer:
             print("  No dependencies found.")
             return
 
-        # Randomized Search for Non-Trivial Factors
-        import random
-        attempts = 0
-        max_attempts = 100
+        # For LLL-based relations, we have: prod(p_i^e_i) ≈ 1
+        # When we combine relations with even total exponents, we get:
+        # prod(p_i^{2*f_i}) = (prod(p_i^f_i))^2 = Y^2
+        # 
+        # We need to find X such that X^2 ≡ Y^2 (mod N)
+        # Strategy: Use the combined product directly and compute GCDs
         
-        print(f"  Attempting to combine dependencies to find X^2 = Y^2 with X != +/-Y...")
+        print(f"  Trying {len(kernel_basis)} kernel vectors to find factors...")
+        
+        # Try each kernel vector and combinations
+        max_attempts = min(1000, len(kernel_basis) * 50)
+        attempts = 0
+        tried_combinations = set()
         
         while attempts < max_attempts:
             attempts += 1
             
             # Pick a random non-empty subset of the kernel basis
-            if len(kernel_basis) > 0:
-                mask = [random.randint(0, 1) for _ in range(len(kernel_basis))]
-                if sum(mask) == 0: mask[0] = 1
+            if len(kernel_basis) == 1:
+                mask = (1,)
             else:
-                break
+                mask = tuple(random.randint(0, 1) for _ in range(len(kernel_basis)))
+                if sum(mask) == 0:
+                    mask = (1,) + mask[1:]
+            
+            if mask in tried_combinations:
+                continue
+            tried_combinations.add(mask)
                 
             # Combine the dependency vectors
-            combined_dependency = [0] * len(self.relations)
+            combined = [0] * len(self.relations)
             for k, bit in enumerate(mask):
                 if bit:
                     for r in range(len(self.relations)):
-                        combined_dependency[r] ^= kernel_basis[k][r]
+                        combined[r] ^= kernel_basis[k][r]
             
-            indices = [k for k, bit in enumerate(combined_dependency) if bit == 1]
-            if not indices: continue
+            indices = [k for k, bit in enumerate(combined) if bit == 1]
+            if not indices:
+                continue
             
-            # Construct X (product of x_i) and Y (sqrt of product of y_i)
-            X = 1
-            Y_exponents = [0] * len(self.primes)
-            
+            # Compute total exponents when combining these relations
+            total_exp = [0] * len(self.primes)
             for idx in indices:
                 rel = self.relations[idx]
-                X = (X * rel['x']) % self.N
                 for p_idx in range(len(self.primes)):
-                    Y_exponents[p_idx] += rel['d_exponents'][p_idx]
+                    total_exp[p_idx] += rel['d_exponents'][p_idx]
             
-            # Compute Y = product(p^(exp/2)) mod N
-            Y = 1
-            valid = True
-            
-            for p_idx in range(len(self.primes)):
-                if Y_exponents[p_idx] % 2 != 0:
-                    valid = False
-                    break
-                    
-                y_half = Y_exponents[p_idx] // 2
-                Y = (Y * pow(self.primes[p_idx], y_half, self.N)) % self.N
-            
-            if not valid: continue
-                
-            # Now X^2 = Y^2 mod N
-            # Check if X != +/- Y
-            if X == Y or X == (self.N - Y) % self.N:
-                # Trivial
+            # All exponents should be even (that's what kernel means)
+            if any(e % 2 != 0 for e in total_exp):
                 continue
-                
-            # Check Factors: gcd(X - Y, N)
-            f1 = GCD((X - Y) % self.N, self.N)
-            f2 = GCD((X + Y) % self.N, self.N)
             
-            if f1 > 1 and f1 < self.N:
-                print(f"\n[SUCCESS] Factor found: {f1}")
-                print(f"Other factor: {self.N // f1}")
-                return
-            elif f2 > 1 and f2 < self.N:
-                print(f"\n[SUCCESS] Factor found: {f2}")
-                print(f"Other factor: {self.N // f2}")
-                return
+            # Compute Y = prod(p_i^(exp_i/2)) mod N
+            Y = 1
+            for p_idx, exp in enumerate(total_exp):
+                half_exp = exp // 2
+                if half_exp > 0:
+                    Y = (Y * pow(self.primes[p_idx], half_exp, self.N)) % self.N
+            
+            # For LLL relations, the product prod(p^e) ≈ 1, so:
+            # prod(p^e) = 1 + k*N for some small k (or = N^m / (1 + k*N))
+            # 
+            # Compute X as product of x values (which are prod_pos % N)
+            X = 1
+            for idx in indices:
+                X = (X * self.relations[idx]['x']) % self.N
+            
+            # Try various factor extractions
+            candidates = [
+                (X - Y) % self.N,
+                (X + Y) % self.N,
+                (X - 1) % self.N,
+                (X + 1) % self.N,
+                (Y - 1) % self.N,
+                (Y + 1) % self.N,
+                (X * Y - 1) % self.N,
+                (X * Y + 1) % self.N,
+            ]
+            
+            # Also try X*Y^(-1) - 1 if Y is invertible
+            try:
+                Y_inv = pow(Y, -1, self.N)
+                candidates.append((X * Y_inv - 1) % self.N)
+                candidates.append((X * Y_inv + 1) % self.N)
+            except:
+                pass
+            
+            for cand in candidates:
+                if cand == 0:
+                    continue
+                f = GCD(cand, self.N)
+                if 1 < f < self.N:
+                    print(f"\n[SUCCESS] Factor found: {f}")
+                    print(f"Other factor: {self.N // f}")
+                    return
         
-        print("\n[FAILURE] Could not find non-trivial factors after random attempts.")
+        print(f"\n[FAILURE] Could not find non-trivial factors after {attempts} attempts.")
+        print("  This may indicate the relations aren't capturing the structure of N.")
+        print("  Try increasing lattice_dim or running again (randomized algorithm).")
 
 if __name__ == "__main__":
     # Target N provided by user
