@@ -21,7 +21,7 @@ Note that it won't outright factor every key... yet.
 |----------|-------------------|--------|
 | RSA-512  | 200×200          | ✅ Factored |
 | RSA-1024 | 500×500          | ✅ Factored |
-| RSA-2048 | 1000×1000        | ✅ **Factored** |
+| RSA-2048 | 1000×1000        | ✅ **Factored** | (Under special circumstances, a modulus that had many relations)
 
 ---
 
