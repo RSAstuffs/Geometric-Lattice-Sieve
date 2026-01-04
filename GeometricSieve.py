@@ -226,10 +226,23 @@ class GeometricFactorizer:
                 # Store as relation for linear algebra phase
                 # Accept all non-trivial relations
                 # Store FULL exponents for reconstruction, not just parity
-                self.relations.append({
+                relation_entry = {
                     'x': 1, # RHS is 1 because pos_product == neg_product mod N => pos/neg == 1
                     'exponents': exponents # Full exponents (can be negative)
-                })
+                }
+                
+                # PARANOID CHECK: Verify the relation object itself
+                check_pos = 1
+                check_neg = 1
+                for i, e in enumerate(relation_entry['exponents']):
+                    if e > 0: check_pos *= pow(self.primes[i], e)
+                    elif e < 0: check_neg *= pow(self.primes[i], -e)
+                
+                if check_pos % self.N != check_neg % self.N:
+                    print(f"    [ERROR] Relation sanity check failed! Exponents: {exponents}")
+                    continue
+                    
+                self.relations.append(relation_entry)
                 pass_relations += 1
             
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
@@ -369,6 +382,23 @@ class GeometricFactorizer:
                 
         print(f"  Found {len(kernel_basis)} independent dependencies (Kernel size).")
         
+        # Verify kernel consistency
+        print("  Verifying kernel consistency...")
+        valid_kernel_count = 0
+        for k_idx, vec in enumerate(kernel_basis):
+            # Check if vec * M = 0
+            check = [0] * num_cols
+            for r, bit in enumerate(vec):
+                if bit:
+                    for c in range(num_cols):
+                        check[c] ^= M[r][c]
+            
+            if any(x != 0 for x in check):
+                print(f"    [ERROR] Kernel vector {k_idx} is INVALID! Residual: {check}")
+            else:
+                valid_kernel_count += 1
+        print(f"  Verified {valid_kernel_count}/{len(kernel_basis)} kernel vectors.")
+        
         if not kernel_basis:
             print("  No dependencies found.")
             return
@@ -432,6 +462,19 @@ class GeometricFactorizer:
             for p_idx in range(len(self.primes)):
                 if Y_exponents[p_idx] % 2 != 0:
                     valid = False
+                    # Debug print for first few failures
+                    if attempt < 5:
+                        print(f"    Debug: Invalid exponent sum for prime {self.primes[p_idx]}: {Y_exponents[p_idx]}")
+                        # Check what the matrix row had
+                        # Reconstruct the sum from the matrix rows
+                        mat_sum = 0
+                        for idx in indices:
+                            rel = self.relations[idx]
+                            if 'exponents' in rel:
+                                mat_sum += abs(rel['exponents'][p_idx]) % 2
+                            elif 'd_exponents' in rel:
+                                mat_sum += rel['d_exponents'][p_idx] % 2
+                        print(f"    Debug: Matrix sum (mod 2) for prime {self.primes[p_idx]}: {mat_sum % 2}")
                     break
                     
                 y_half = Y_exponents[p_idx] // 2
@@ -454,6 +497,36 @@ class GeometricFactorizer:
             if not valid: continue
                 
             # Now X^2 = Y^2 mod N
+            
+            # Debug: Check if X^2 == Y^2
+            X2 = pow(X, 2, self.N)
+            Y2 = pow(Y, 2, self.N)
+            if X2 != Y2:
+                if attempt < 5:
+                    print(f"    Debug: Relation mismatch! X^2 = {X2}, Y^2 = {Y2}")
+                    # Try to diagnose which relation is bad
+                    print("    Diagnosing individual relations in this combination...")
+                    for idx in indices:
+                        rel = self.relations[idx]
+                        # Re-verify this relation
+                        r_pos = 1
+                        r_neg = 1
+                        if 'exponents' in rel:
+                            for i, e in enumerate(rel['exponents']):
+                                if e > 0: r_pos *= pow(self.primes[i], e)
+                                elif e < 0: r_neg *= pow(self.primes[i], -e)
+                            
+                            if r_pos % self.N != r_neg % self.N:
+                                print(f"      [BAD RELATION] Index {idx} is invalid! {r_pos%self.N} != {r_neg%self.N}")
+                        elif 'd_exponents' in rel:
+                            # Sieve relation: x^2 = prod p^e
+                            rhs = 1
+                            for i, e in enumerate(rel['d_exponents']):
+                                rhs *= pow(self.primes[i], e)
+                            lhs = pow(rel['x'], 2)
+                            if lhs % self.N != rhs % self.N:
+                                print(f"      [BAD RELATION] Sieve Index {idx} is invalid!")
+            
             # Check if X != +/- Y
             if X == Y or X == (self.N - Y) % self.N:
                 trivial_count += 1
@@ -464,6 +537,11 @@ class GeometricFactorizer:
             # Check Factors: gcd(X - Y, N)
             f1 = GCD((X - Y) % self.N, self.N)
             f2 = GCD((X + Y) % self.N, self.N)
+            
+            if attempt < 5:
+                print(f"    Debug: Non-trivial candidate! X={X}, Y={Y}")
+                print(f"    gcd(X-Y, N) = {f1}")
+                print(f"    gcd(X+Y, N) = {f2}")
             
             if f1 > 1 and f1 < self.N:
                 print(f"\n[SUCCESS] Factor found: {f1}")
@@ -479,7 +557,7 @@ class GeometricFactorizer:
 
 if __name__ == "__main__":
     # Target N provided by user
-    N = 1212
+    N = 261980999226229
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
     # Use 700x700 lattice to get more relations
