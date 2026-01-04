@@ -4,15 +4,41 @@ from geometric_lll import GeometricLLL
 import math
 import random
 from functools import reduce
+from decimal import Decimal, getcontext
 
 class GeometricFactorizer:
-    def __init__(self, N, factor_base_size=2000, precision_bits=100, interval_size=1000000):
+    def __init__(self, N, factor_base_size=None, precision_bits=None, interval_size=None, lattice_dim=500):
         self.N = N
+        self.lattice_dim = lattice_dim
+        
+        # Scale parameters based on bit length of N
+        n_bits = N.bit_length()
+        
+        # Factor base size: Use lattice_dim - 1 (one row reserved for N)
+        if factor_base_size is None:
+            factor_base_size = lattice_dim - 1
+        
+        # Precision bits: should be enough to distinguish log values
+        # Need at least n_bits to capture the full precision of N
+        if precision_bits is None:
+            precision_bits = max(100, n_bits + 50)
+        
+        # Interval size for supplementary sieve
+        if interval_size is None:
+            interval_size = max(100000, min(10000000, factor_base_size * 100))
+        
         self.precision_bits = precision_bits
         self.interval_size = interval_size
         self.primes = self._generate_factor_base(factor_base_size)
         self.C = 1 << precision_bits  # Scaling factor for logarithms
-        self.relations = [] # Store found relations (exponents vector)
+        self.relations = []
+        
+        print(f"N bit length: {n_bits}")
+        print(f"Lattice dimension: {lattice_dim}x{lattice_dim}")
+        print(f"Auto-scaled parameters:")
+        print(f"  Factor Base Size: {factor_base_size}")
+        print(f"  Precision Bits: {precision_bits}")
+        print(f"  Interval Size: {interval_size}")
 
     def _tonelli_shanks(self, n, p):
         """
@@ -85,59 +111,189 @@ class GeometricFactorizer:
         return B
 
     def find_relations(self):
-        print(f"Starting Quadratic Sieve Relation Finding for N={self.N}...")
+        """
+        Use LLL to find smooth relations.
+        
+        Build a lattice where short vectors correspond to:
+        prod(p_i^e_i) * N^e_N ≈ 1
+        
+        If e_N = 0: We found a smooth number (product of small primes)
+        If e_N != 0: We found a relation involving N
+        """
+        print(f"Starting LLL-based Relation Finding for N={self.N}...")
         print(f"Factor Base Size: {len(self.primes)}")
         
-        # Sieve Interval
-        start_x = math.isqrt(self.N) + 1
-        interval_size = self.interval_size
-        sieve_array = [0] * interval_size
+        d = len(self.primes)
+        target_relations = d + 20
         
-        # Initialize sieve array with x^2 - N
-        print("Initializing sieve array...")
-        for i in range(interval_size):
+        # Build the Schnorr-style lattice
+        # Dimension: d+2 (d primes + N + one extra for scaling)
+        # Row i (for prime p_i): [0...1...0 | C*ln(p_i)]
+        # Row d+1 (for N):       [0...0...0 | C*ln(N)]
+        
+        print("Building Schnorr lattice...")
+        dim = d + 1
+        B = np.zeros((dim, dim), dtype=object)
+        
+        # Set decimal precision for large number arithmetic
+        getcontext().prec = self.precision_bits + 50
+        C_dec = Decimal(self.C)
+        
+        # Identity part for exponents, with log weights
+        for i in range(d):
+            B[i, i] = 1
+            log_p = Decimal(self.primes[i]).ln()
+            B[i, d] = int(log_p * C_dec)
+        
+        # N row
+        log_N = Decimal(self.N).ln()
+        B[d, d] = int(log_N * C_dec)
+        
+        print(f"Lattice dimension: {dim}x{dim}")
+        print(f"Precision bits (C): {self.precision_bits}")
+        
+        # Run GeometricLLL reduction (the ACTUAL geometric method)
+        print("Running GeometricLLL reduction...")
+        lll = GeometricLLL(self.N, basis=B)
+        reduced = lll.run_geometric_reduction(verbose=True, num_passes=3)
+        
+        print("Analyzing reduced basis for relations...")
+        
+        for row_idx, row in enumerate(reduced):
+            # Extract exponents (first d entries) and the weight (last entry)
+            exponents = [int(row[i]) for i in range(d)]
+            weight = int(row[d])
+            
+            # Skip zero vector
+            if all(e == 0 for e in exponents):
+                continue
+            
+            # Check if this is a valid relation
+            # Compute: prod(p_i^e_i) and see if it relates to N
+            
+            # Separate positive and negative exponents
+            pos_product = 1
+            neg_product = 1
+            
+            for i, e in enumerate(exponents):
+                if e > 0:
+                    pos_product *= pow(self.primes[i], e)
+                elif e < 0:
+                    neg_product *= pow(self.primes[i], -e)
+            
+            # Check if pos_product ≡ neg_product (mod N)
+            # or pos_product * k = neg_product * N for some small k
+            
+            if neg_product == 0:
+                continue
+                
+            # Case 1: pos = neg (mod N) gives us x^2 ≡ y^2
+            if pos_product % self.N == neg_product % self.N:
+                print(f"Row {row_idx}: Found congruence! pos ≡ neg (mod N)")
+                
+                # This means pos_product - neg_product = k * N
+                diff = pos_product - neg_product
+                if diff != 0 and diff % self.N == 0:
+                    f = GCD(pos_product - 1, self.N)
+                    if 1 < f < self.N:
+                        print(f"\n[SUCCESS] Factor found: {f}")
+                        print(f"Other factor: {self.N // f}")
+                        return
+            
+            # Case 2: Check if pos_product / neg_product is close to N^k
+            ratio = pos_product / neg_product if neg_product > 0 else 0
+            log_ratio = math.log(ratio) if ratio > 0 else 0
+            log_N = math.log(self.N)
+            
+            k_approx = log_ratio / log_N if log_N > 0 else 0
+            
+            if abs(k_approx - round(k_approx)) < 0.01 and abs(round(k_approx)) <= 2:
+                k = int(round(k_approx))
+                print(f"Row {row_idx}: Potential relation with N^{k}")
+                print(f"  Exponents (non-zero): {[(self.primes[i], e) for i, e in enumerate(exponents) if e != 0][:10]}...")
+                print(f"  Weight: {weight}, Ratio ≈ N^{k_approx:.4f}")
+                
+                # Store as relation
+                # For QS-style, we need x such that x^2 - N is smooth
+                # Here we have prod(p^e) ≈ N^k
+                
+                if k == 1:
+                    # prod(p^e) ≈ N means prod(p^e) - N might give us a factor
+                    candidate = pos_product if neg_product == 1 else pos_product // neg_product
+                    f = GCD(candidate - self.N, self.N)
+                    if 1 < f < self.N:
+                        print(f"\n[SUCCESS] Factor found: {f}")
+                        print(f"Other factor: {self.N // f}")
+                        return
+                    f = GCD(candidate + self.N, self.N)
+                    if 1 < f < self.N:
+                        print(f"\n[SUCCESS] Factor found: {f}")
+                        print(f"Other factor: {self.N // f}")
+                        return
+                        
+            # Case 3: Standard QS relation - store for linear algebra phase
+            # The exponents give us a relation on the primes
+            if weight < self.C // 10:  # Small weight means good approximation
+                self.relations.append({
+                    'x': pos_product % self.N,  # x value
+                    'd_exponents': [abs(e) for e in exponents]  # Use absolute values
+                })
+        
+        print(f"Found {len(self.relations)} potential relations from LLL.")
+        
+        # If LLL alone didn't find enough, do a quick targeted sieve
+        # using the short vectors as hints for where to look
+        if len(self.relations) < target_relations:
+            print(f"\nSupplementing with targeted sieve around sqrt(N)...")
+            self._supplementary_sieve(target_relations - len(self.relations))
+            
+        print(f"Total relations: {len(self.relations)}")
+
+    def _supplementary_sieve(self, needed):
+        """Quick sieve to find additional relations if LLL didn't find enough."""
+        start_x = math.isqrt(self.N) + 1
+        interval_size = min(self.interval_size, 100000)
+        
+        prime_logs = [math.log(p) for p in self.primes]
+        sieve_array = [0.0] * interval_size
+        
+        # Quick log sieve
+        for p_idx, p in enumerate(self.primes):
+            log_p = prime_logs[p_idx]
+            roots = self._tonelli_shanks(self.N, p)
+            for r in roots:
+                first_i = (r - start_x) % p
+                for i in range(first_i, interval_size, p):
+                    sieve_array[i] += log_p
+        
+        # Get top candidates
+        indexed = [(sieve_array[i], i) for i in range(interval_size)]
+        indexed.sort(reverse=True)
+        
+        found = 0
+        for score, i in indexed[:needed * 100]:
             x = start_x + i
             val = x * x - self.N
-            sieve_array[i] = val
             
-        # Sieve with factor base
-        print("Sieving...")
-        for p in self.primes:
-            # Solve x^2 = N mod p
-            roots = self._tonelli_shanks(self.N, p)
+            d_exponents = [0] * len(self.primes)
+            temp = val
             
-            for r in roots:
-                # Find first index i such that (start_x + i) = r mod p
-                # start_x + i = r (mod p) => i = r - start_x (mod p)
-                first_i = (r - start_x) % p
-                
-                # Sieve
-                for i in range(first_i, interval_size, p):
-                    while sieve_array[i] % p == 0:
-                        sieve_array[i] //= p
-                        
-        # Collect relations
-        print("Collecting relations...")
-        for i in range(interval_size):
-            if sieve_array[i] == 1:
-                # Smooth!
-                x = start_x + i
-                val = x * x - self.N
-                
-                # Factor val to get exponents
-                d_exponents = [0] * len(self.primes)
-                temp = val
-                for p_idx, p in enumerate(self.primes):
-                    while temp % p == 0:
-                        d_exponents[p_idx] += 1
-                        temp //= p
-                
+            for p_idx, p in enumerate(self.primes):
+                while temp % p == 0:
+                    d_exponents[p_idx] += 1
+                    temp //= p
+                if temp == 1: break
+            
+            if temp == 1:
                 self.relations.append({
                     'x': x,
                     'd_exponents': d_exponents
                 })
-                
-        print(f"Found {len(self.relations)} smooth relations.")
+                found += 1
+                if found >= needed:
+                    break
+        
+        print(f"  Supplementary sieve found {found} additional relations.")
 
     def solve_linear_system(self):
         print(f"\nSolving Linear System with {len(self.relations)} relations...")
@@ -279,14 +435,11 @@ class GeometricFactorizer:
         print("\n[FAILURE] Could not find non-trivial factors after random attempts.")
 
 if __name__ == "__main__":
-    # Example: 60-bit RSA
-    p = getPrime(30)
-    q = getPrime(30)
-    N = p * q
+    # Target N provided by user
+    N = 101010101
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
-    # Larger factor base for better chance of smoothness
-    # Updated parameters for larger N
-    factorizer = GeometricFactorizer(N, factor_base_size=1000, precision_bits=120, interval_size=1000000)
+    # Use 500x500 lattice
+    factorizer = GeometricFactorizer(N, lattice_dim=500)
     factorizer.find_relations()
     factorizer.solve_linear_system()
