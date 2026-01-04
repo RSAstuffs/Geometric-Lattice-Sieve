@@ -8,7 +8,8 @@ Geomancer is a powerful integer factorization tool that successfully factors **R
 
 ## Current status of Python implementation
 - On large N, it returns 'failed to find non-trivial factorization', even though a non-trivial is found.
-- Dimension needs to be REALLY high to factor large N.
+- Dimension needs to be REALLY high to not see this message, and to factor large N.
+- Forks are welcome!!!!!
 
 ---
 
