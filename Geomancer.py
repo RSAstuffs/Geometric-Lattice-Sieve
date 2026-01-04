@@ -39,13 +39,12 @@ class GeometricFactorizer:
         # Scale parameters based on bit length of N
         n_bits = N.bit_length()
         
-        # Factor base size: Use a FIXED small number to ensure relations > primes
+        # Factor base size: Use lattice_dim - 1 primes to match the lattice dimension
         # Key insight: LLL on a (d+1) dimensional lattice gives us d vectors
-        # We need relations > primes, so use ~100-150 primes regardless of lattice size
+        # We need relations > primes, so factor_base_size = lattice_dim - 1
         if factor_base_size is None:
-            # For 2048-bit RSA, use ~150 primes
-            # LLL will find ~150 relations per pass, with multiple passes we get 300+
-            factor_base_size = min(150, lattice_dim - 1)
+            # Factor base size is lattice_dim - 1 (adjustable via GUI)
+            factor_base_size = lattice_dim - 1
         
         # Precision bits: should be enough to distinguish log values
         if precision_bits is None:
