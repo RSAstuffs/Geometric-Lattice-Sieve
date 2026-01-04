@@ -31,6 +31,7 @@ Note that it won't outright factor every key... yet.
 - **Multi-Pass LLL**: Runs multiple reduction passes with varied scaling to maximize unique relations
 - **Hybrid Approach**: Falls back to targeted sieving when additional relations are needed
 - **High-Precision Arithmetic**: Uses Python's Decimal module for exact log calculations on 2048-bit numbers
+- **Neural Network**: Custom Transformer to learn relations to assist with factoring at lower dimension
 - **Full GUI**: Comprehensive tkinter-based interface with real-time logging and statistics
 
 ---
