@@ -113,23 +113,39 @@ class GeometricFactorizer:
         
         return B
 
+    def _factor_over_base(self, n, primes):
+        """
+        Factors n over the factor base. Returns (exponents, remainder).
+        exponents includes -1 as the first element.
+        """
+        if n == 0: return None, 0
+        
+        exponents = [0] * (len(primes) + 1) # +1 for -1
+        
+        if n < 0:
+            exponents[0] = 1
+            n = -n
+            
+        for i, p in enumerate(primes):
+            while n % p == 0:
+                exponents[i+1] += 1
+                n //= p
+            if n == 1:
+                break
+                
+        return exponents, n
+
     def find_relations(self):
         """
         Use LLL to find smooth relations.
-        
-        Build a lattice where short vectors correspond to:
-        prod(p_i^e_i) * N^e_N ≈ 1
-        
-        If e_N = 0: We found a smooth number (product of small primes)
-        If e_N != 0: We found a relation involving N
         """
         print(f"Starting LLL-based Relation Finding for N={self.N}...")
         print(f"Factor Base Size: {len(self.primes)}")
         
         d = len(self.primes)
-        target_relations = d + 10  # Need slightly more relations than primes
+        target_relations = d + 20
         
-        # Set decimal precision for large number arithmetic
+        # Set decimal precision
         getcontext().prec = self.precision_bits + 50
         C_dec = Decimal(self.C)
         
@@ -137,42 +153,35 @@ class GeometricFactorizer:
         log_primes = [Decimal(p).ln() for p in self.primes]
         log_N = Decimal(self.N).ln()
         
-        seen_relations = set()  # Track unique relations
+        seen_relations = set()
         
-        # Run multiple passes with RANDOMIZED bases to get different short vectors
-        max_passes = 20
+        # Run multiple passes
+        max_passes = 50
         
         for pass_num in range(max_passes):
             print(f"\n=== Pass {pass_num + 1} (have {len(self.relations)}/{target_relations} relations) ===")
             
-            # Build the Schnorr-style lattice
+            # Build lattice
             dim = d + 1
             B = np.zeros((dim, dim), dtype=object)
             
-            # Identity part for exponents, with log weights
             for i in range(d):
                 B[i, i] = 1
                 B[i, d] = int(log_primes[i] * C_dec)
             
-            # N row
             B[d, d] = int(log_N * C_dec)
             
-            # Apply random unimodular transformation (preserves lattice, changes basis)
+            # Randomize basis
             if pass_num > 0:
-                # Random row operations: add/subtract rows
                 for _ in range(d):
                     i, j = random.sample(range(d), 2)
                     sign = random.choice([-1, 1])
                     B[i] = B[i] + sign * B[j]
-                
-                # Random permutation of rows (excluding last row which is N)
                 perm = list(range(d))
                 random.shuffle(perm)
                 B[:d] = B[perm]
             
             print(f"Lattice dimension: {dim}x{dim}")
-            
-            # Run GeometricLLL reduction
             print("Running GeometricLLL reduction...")
             lll = GeometricLLL(self.N, basis=B)
             reduced = lll.run_geometric_reduction(verbose=False, num_passes=3)
@@ -180,64 +189,86 @@ class GeometricFactorizer:
             print("Analyzing reduced basis for relations...")
             
             pass_relations = 0
-            for row_idx, row in enumerate(reduced):
-                # Extract exponents (first d entries) and the weight (last entry)
-                exponents = tuple(int(row[i]) for i in range(d))
-                weight = int(row[d])
+            for row in reduced:
+                exponents = [int(row[i]) for i in range(d)]
+                weight = int(row[d]) # This is approx log(prod) - e_N * log(N)
                 
-                # Skip zero vector
-                if all(e == 0 for e in exponents):
-                    continue
+                if all(e == 0 for e in exponents): continue
                 
-                # Normalize: make first non-zero positive (canonical form)
-                first_nonzero = next((e for e in exponents if e != 0), 0)
-                if first_nonzero < 0:
-                    exponents = tuple(-e for e in exponents)
+                # Reconstruct e_N from the weight
+                # weight ≈ C * (sum e_i ln p_i + e_N ln N)
+                # sum e_i ln p_i + e_N ln N ≈ 0
+                # e_N ≈ - (sum e_i ln p_i) / ln N
                 
-                # Skip already seen
-                if exponents in seen_relations:
-                    continue
-                    
-                seen_relations.add(exponents)
+                sum_log = sum(e * lp for e, lp in zip(exponents, log_primes))
+                e_N = -int(round(sum_log / log_N))
                 
-                # Separate positive and negative exponents
+                if e_N == 0: continue # Trivial relation between small primes
+                
+                # Calculate delta
+                # If e_N > 0: U * N^e_N - V = delta
+                # If e_N < 0: U - V * N^(-e_N) = delta
+                
                 pos_product = 1
                 neg_product = 1
-                
                 for i, e in enumerate(exponents):
-                    if e > 0:
-                        pos_product *= pow(self.primes[i], e)
-                    elif e < 0:
-                        neg_product *= pow(self.primes[i], -e)
+                    if e > 0: pos_product *= pow(self.primes[i], e)
+                    elif e < 0: neg_product *= pow(self.primes[i], -e)
                 
-                if neg_product == 0:
-                    continue
+                if e_N > 0:
+                    delta = pos_product * pow(self.N, e_N) - neg_product
+                    # Relation: V = -delta (mod N) -> V * (-delta)^-1 = 1
+                    # V is prod p_i^{-e_i} (where e_i < 0)
+                    # We need to factor delta
+                    delta_exps, remainder = self._factor_over_base(delta, self.primes)
                     
-                # Quick factor check
-                if pos_product % self.N == neg_product % self.N:
-                    diff = pos_product - neg_product
-                    if diff != 0 and diff % self.N == 0:
-                        f = GCD(pos_product - 1, self.N)
-                        if 1 < f < self.N:
-                            print(f"\n[SUCCESS] Factor found: {f}")
-                            print(f"Other factor: {self.N // f}")
-                            return
-                
-                # Store as relation for linear algebra phase
-                # Accept all non-trivial relations
-                self.relations.append({
-                    'x': pos_product % self.N,
-                    'd_exponents': [abs(e) % 2 for e in exponents]  # GF(2) parity
-                })
-                pass_relations += 1
-            
+                    if remainder == 1:
+                        # Construct relation vector (including -1 at index 0)
+                        # V contribution: +(-e_i) for e_i < 0
+                        # delta contribution: -delta_exps
+                        # -1 contribution: we have -delta, so we need to add 1 to the exponent of -1
+                        # (since -delta = (-1) * delta)
+                        
+                        rel_vec = [0] * (d + 1)
+                        # Add V exponents
+                        for i, e in enumerate(exponents):
+                            if e < 0: rel_vec[i+1] += -e
+                            
+                        # Subtract delta exponents
+                        for i in range(d + 1):
+                            rel_vec[i] -= delta_exps[i]
+                        
+                        # Add the missing -1 factor from V = -delta
+                        rel_vec[0] += 1
+                            
+                        self.relations.append({'vec': rel_vec})
+                        pass_relations += 1
+                        
+                else: # e_N < 0
+                    k = -e_N
+                    delta = pos_product - neg_product * pow(self.N, k)
+                    # Relation: U = delta (mod N) -> U * delta^-1 = 1
+                    delta_exps, remainder = self._factor_over_base(delta, self.primes)
+                    
+                    if remainder == 1:
+                        rel_vec = [0] * (d + 1)
+                        # Add U exponents
+                        for i, e in enumerate(exponents):
+                            if e > 0: rel_vec[i+1] += e
+                            
+                        # Subtract delta exponents
+                        for i in range(d + 1):
+                            rel_vec[i] -= delta_exps[i]
+                            
+                        self.relations.append({'vec': rel_vec})
+                        pass_relations += 1
+
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
             
             if len(self.relations) >= target_relations:
-                print(f"Target reached! Have {len(self.relations)} relations > {d} primes.")
                 break
         
-        print(f"Found {len(self.relations)} relations from LLL passes.")
+        print(f"Found {len(self.relations)} relations.")
         
         # If LLL alone didn't find enough, do a targeted sieve
         if len(self.relations) < target_relations:
@@ -272,19 +303,26 @@ class GeometricFactorizer:
             x = start_x + i
             val = x * x - self.N
             
-            d_exponents = [0] * len(self.primes)
+            # Factor val over factor base
+            # val = (-1)^s * prod p^e
+            
             temp = val
+            vec = [0] * (len(self.primes) + 1)
+            
+            if temp < 0:
+                vec[0] = 1
+                temp = -temp
             
             for p_idx, p in enumerate(self.primes):
                 while temp % p == 0:
-                    d_exponents[p_idx] += 1
+                    vec[p_idx+1] += 1
                     temp //= p
                 if temp == 1: break
             
             if temp == 1:
                 self.relations.append({
                     'x': x,
-                    'd_exponents': d_exponents
+                    'vec': vec
                 })
                 found += 1
                 if found >= needed:
@@ -295,28 +333,22 @@ class GeometricFactorizer:
     def solve_linear_system(self):
         print(f"\nSolving Linear System with {len(self.relations)} relations...")
         
-        if len(self.relations) < 10:
-            print("Too few relations to attempt solution.")
-            return
-            
         if len(self.relations) < len(self.primes):
-            print(f"Warning: Have {len(self.relations)} relations but {len(self.primes)} primes.")
-            print("Attempting anyway - may still find dependencies...")
+            print("Warning: Fewer relations than primes.")
 
-        # Build Matrix M (relations x primes) over GF(2)
+        # Build Matrix M (relations x (primes+1)) over GF(2)
         M = []
         for rel in self.relations:
-            row = [x % 2 for x in rel['d_exponents']]
+            row = [x % 2 for x in rel['vec']]
             M.append(row)
             
-        # Gaussian Elimination to find Kernel Basis
+        # Gaussian Elimination
         matrix = [row[:] for row in M]
         num_rows = len(matrix)
         num_cols = len(matrix[0])
         
         print(f"  Building {num_rows}x{num_cols} matrix over GF(2)...")
         
-        # Augmented with Identity to track combinations
         augmented = []
         for i in range(num_rows):
             aug_row = matrix[i] + [0] * num_rows
@@ -347,7 +379,6 @@ class GeometricFactorizer:
             pivot_row += 1
             col += 1
             
-        # Collect Basis Vectors of the Kernel
         kernel_basis = []
         for i in range(num_rows):
             is_zero = True
@@ -358,42 +389,29 @@ class GeometricFactorizer:
             if is_zero:
                 kernel_basis.append(augmented[i][num_cols:])
                 
-        print(f"  Found {len(kernel_basis)} independent dependencies (Kernel size).")
+        print(f"  Found {len(kernel_basis)} independent dependencies.")
         
         if not kernel_basis:
-            print("  No dependencies found.")
             return
 
-        # For LLL-based relations, we have: prod(p_i^e_i) ≈ 1
-        # When we combine relations with even total exponents, we get:
-        # prod(p_i^{2*f_i}) = (prod(p_i^f_i))^2 = Y^2
-        # 
-        # We need to find X such that X^2 ≡ Y^2 (mod N)
-        # Strategy: Use the combined product directly and compute GCDs
+        print(f"  Trying kernel vectors to find factors...")
         
-        print(f"  Trying {len(kernel_basis)} kernel vectors to find factors...")
-        
-        # Try each kernel vector and combinations
-        max_attempts = min(1000, len(kernel_basis) * 50)
+        import random
         attempts = 0
-        tried_combinations = set()
+        tried = set()
         
-        while attempts < max_attempts:
+        while attempts < 1000:
             attempts += 1
             
-            # Pick a random non-empty subset of the kernel basis
             if len(kernel_basis) == 1:
                 mask = (1,)
             else:
                 mask = tuple(random.randint(0, 1) for _ in range(len(kernel_basis)))
-                if sum(mask) == 0:
-                    mask = (1,) + mask[1:]
+                if sum(mask) == 0: mask = (1,) + mask[1:]
             
-            if mask in tried_combinations:
-                continue
-            tried_combinations.add(mask)
-                
-            # Combine the dependency vectors
+            if mask in tried: continue
+            tried.add(mask)
+            
             combined = [0] * len(self.relations)
             for k, bit in enumerate(mask):
                 if bit:
@@ -401,67 +419,56 @@ class GeometricFactorizer:
                         combined[r] ^= kernel_basis[k][r]
             
             indices = [k for k, bit in enumerate(combined) if bit == 1]
-            if not indices:
-                continue
+            if not indices: continue
             
-            # Compute total exponents when combining these relations
-            total_exp = [0] * len(self.primes)
-            for idx in indices:
-                rel = self.relations[idx]
-                for p_idx in range(len(self.primes)):
-                    total_exp[p_idx] += rel['d_exponents'][p_idx]
-            
-            # All exponents should be even (that's what kernel means)
-            if any(e % 2 != 0 for e in total_exp):
-                continue
-            
-            # Compute Y = prod(p_i^(exp_i/2)) mod N
-            Y = 1
-            for p_idx, exp in enumerate(total_exp):
-                half_exp = exp // 2
-                if half_exp > 0:
-                    Y = (Y * pow(self.primes[p_idx], half_exp, self.N)) % self.N
-            
-            # For LLL relations, the product prod(p^e) ≈ 1, so:
-            # prod(p^e) = 1 + k*N for some small k (or = N^m / (1 + k*N))
-            # 
-            # Compute X as product of x values (which are prod_pos % N)
+            # Calculate X = prod(x_k)
             X = 1
             for idx in indices:
                 X = (X * self.relations[idx]['x']) % self.N
             
-            # Try various factor extractions
-            candidates = [
-                (X - Y) % self.N,
-                (X + Y) % self.N,
-                (X - 1) % self.N,
-                (X + 1) % self.N,
-                (Y - 1) % self.N,
-                (Y + 1) % self.N,
-                (X * Y - 1) % self.N,
-                (X * Y + 1) % self.N,
-            ]
+            # Calculate Y = sqrt(prod(relations))
+            # Each relation is x^2 = (-1)^s * prod p^e (mod N)
+            # Or 1 = x^-2 * (-1)^s * prod p^e (mod N)
+            # We stored vec = [s, e_1, e_2, ...]
+            # Sum of vecs is even (2S, 2E_1, ...)
+            # Y = (-1)^S * prod p^E_i
             
-            # Also try X*Y^(-1) - 1 if Y is invertible
-            try:
-                Y_inv = pow(Y, -1, self.N)
-                candidates.append((X * Y_inv - 1) % self.N)
-                candidates.append((X * Y_inv + 1) % self.N)
-            except:
-                pass
+            total_exp = [0] * (len(self.primes) + 1)
+            for idx in indices:
+                vec = self.relations[idx]['vec']
+                for i in range(len(total_exp)):
+                    total_exp[i] += vec[i]
             
-            for cand in candidates:
-                if cand == 0:
-                    continue
-                f = GCD(cand, self.N)
-                if 1 < f < self.N:
-                    print(f"\n[SUCCESS] Factor found: {f}")
-                    print(f"Other factor: {self.N // f}")
-                    return
+            if any(e % 2 != 0 for e in total_exp): continue
+            
+            # Y = (-1)^(e_0/2) * prod p_i^(e_i/2)
+            Y = 1
+            if total_exp[0] // 2 % 2 == 1:
+                Y = self.N - 1
+                
+            for i, p in enumerate(self.primes):
+                exp = total_exp[i+1] // 2
+                if exp != 0:
+                    Y = (Y * pow(p, exp, self.N)) % self.N
+            
+            # X^2 = Y^2 mod N
+            
+            if X == Y or X == (self.N - Y) % self.N:
+                continue
+            
+            f1 = GCD(X - Y, self.N)
+            if 1 < f1 < self.N:
+                print(f"\n[SUCCESS] Factor found: {f1}")
+                print(f"Other factor: {self.N // f1}")
+                return
+                
+            f2 = GCD(X + Y, self.N)
+            if 1 < f2 < self.N:
+                print(f"\n[SUCCESS] Factor found: {f2}")
+                print(f"Other factor: {self.N // f2}")
+                return
         
-        print(f"\n[FAILURE] Could not find non-trivial factors after {attempts} attempts.")
-        print("  This may indicate the relations aren't capturing the structure of N.")
-        print("  Try increasing lattice_dim or running again (randomized algorithm).")
+        print(f"Failed to find factors after {attempts} attempts.")
 
 if __name__ == "__main__":
     # Target N provided by user
