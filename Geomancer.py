@@ -210,7 +210,7 @@ class GeometricFactorizer:
             print("Running GeometricLLL reduction...")
             lll = GeometricLLL(self.N, basis=B)
             # Reduced passes for performance (was 10)
-            reduced = lll.run_geometric_reduction(verbose=False, num_passes=4)
+            reduced = lll.run_geometric_reduction(verbose=False, num_passes=1)
             
             print("Analyzing reduced basis for relations...")
             
@@ -250,24 +250,36 @@ class GeometricFactorizer:
                 
                 if remainder == 1 or remainder == -1: # -1 handled by sign bit in delta_exps
                     # Construct full relation vector
-                    # ... (logic as before) ...
+                    # For Schnorr relations: prod(p^e) ≡ 1 (mod N)
+                    # We need X such that X^2 ≡ Y^2 (mod N)
+                    # X = product of primes with positive exponents
+                    # Y = product of primes with negative exponents (times delta factors)
                     
                     rel_vec = [0] * (d + 1)
                     
+                    # Compute X value for this relation
+                    # X is the "numerator" side of the relation
+                    X_val = 1
+                    
                     if e_N > 0:
-                        # V part (from negative exponents in LLL vector)
+                        # Relation: V ≡ U * N^e_N - delta (mod N)
+                        # V = neg_product, U * N^e_N = pos_product * N^e_N
+                        # So: neg_product ≡ pos_product * N^e_N - delta (mod N)
+                        # X = neg_product (the smooth part we're trying to factor)
+                        X_val = neg_product % self.N
+                        
                         for i, e in enumerate(exponents):
                             if e < 0: rel_vec[i+1] += -e
-                        # -delta part
                         for i in range(d + 1):
                             rel_vec[i] -= delta_exps[i]
-                        # Adjust for -1 in -delta
                         rel_vec[0] -= 1 
                     else:
-                        # U part (from positive exponents in LLL vector)
+                        # Relation: U ≡ V * N^(-e_N) + delta (mod N)
+                        # X = pos_product
+                        X_val = pos_product % self.N
+                        
                         for i, e in enumerate(exponents):
                             if e > 0: rel_vec[i+1] += e
-                        # -delta part
                         for i in range(d + 1):
                             rel_vec[i] -= delta_exps[i]
                             
@@ -275,7 +287,7 @@ class GeometricFactorizer:
                     rel_vec[0] = rel_vec[0] % 2
                     
                     self.relations.append({
-                        'x': 1,
+                        'x': X_val,
                         'exponents': rel_vec
                     })
                     pass_relations += 1
@@ -289,13 +301,17 @@ class GeometricFactorizer:
                     
                     # Construct rel_vec (same as for full relation)
                     rel_vec = [0] * (d + 1)
+                    X_val = 1
+                    
                     if e_N > 0:
+                        X_val = neg_product % self.N
                         for i, e in enumerate(exponents):
                             if e < 0: rel_vec[i+1] += -e
                         for i in range(d + 1):
                             rel_vec[i] -= delta_exps[i]
                         rel_vec[0] -= 1 
                     else:
+                        X_val = pos_product % self.N
                         for i, e in enumerate(exponents):
                             if e > 0: rel_vec[i+1] += e
                         for i in range(d + 1):
@@ -306,7 +322,7 @@ class GeometricFactorizer:
                     
                     # Store as partial relation with remainder
                     self.relations.append({
-                        'x': 1,
+                        'x': X_val,
                         'exponents': rel_vec,
                         'remainder': lp
                     })
