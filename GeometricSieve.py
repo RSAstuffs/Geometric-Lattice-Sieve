@@ -241,7 +241,7 @@ class GeometricFactorizer:
                         # Add the missing -1 factor from V = -delta
                         rel_vec[0] += 1
                             
-                        self.relations.append({'vec': rel_vec})
+                        self.relations.append({'vec': rel_vec, 'x': 1})
                         pass_relations += 1
                         
                 else: # e_N < 0
@@ -260,7 +260,7 @@ class GeometricFactorizer:
                         for i in range(d + 1):
                             rel_vec[i] -= delta_exps[i]
                             
-                        self.relations.append({'vec': rel_vec})
+                        self.relations.append({'vec': rel_vec, 'x': 1})
                         pass_relations += 1
 
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
@@ -472,7 +472,7 @@ class GeometricFactorizer:
 
 if __name__ == "__main__":
     # Target N provided by user
-    N = 1212
+    N = 2021
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
     # Use 700x700 lattice to get more relations
