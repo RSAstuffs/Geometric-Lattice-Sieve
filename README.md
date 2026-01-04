@@ -2,6 +2,8 @@
 
 **Lattice-Based RSA Factorization using GeometricLLL**
 
+<img width="1176" height="771" alt="image" src="https://github.com/user-attachments/assets/77fb7687-dad0-4065-95ee-12691d41eeba" />
+
 Geomancer is a powerful integer factorization tool that successfully factors **RSA-2048** by combining lattice-based relation finding with the blazing-fast GeometricLLL reduction algorithm.
 
 ---
