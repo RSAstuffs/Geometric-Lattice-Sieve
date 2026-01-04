@@ -261,15 +261,18 @@ class GeometricFactorizer:
                     rel_vec = [0] * (d + 1)
                     
                     # Compute X value for this relation
-                    # X is the "numerator" side of the relation
+                    # For Schnorr relations (prod(p^e) = 1 mod N), the LHS is 1.
+                    # We are constructing Y such that Y^2 = 1 mod N.
+                    # So X should be 1.
                     X_val = 1
                     
                     if e_N > 0:
                         # Relation: V ≡ U * N^e_N - delta (mod N)
                         # V = neg_product, U * N^e_N = pos_product * N^e_N
                         # So: neg_product ≡ pos_product * N^e_N - delta (mod N)
-                        # X = neg_product (the smooth part we're trying to factor)
-                        X_val = neg_product % self.N
+                        # neg_product + delta = pos_product * N^e_N
+                        # neg_product = -delta (mod N)
+                        # rel_vec encodes neg_product / delta = -1
                         
                         for i, e in enumerate(exponents):
                             if e < 0: rel_vec[i+1] += -e
@@ -278,8 +281,9 @@ class GeometricFactorizer:
                         rel_vec[0] -= 1 
                     else:
                         # Relation: U ≡ V * N^(-e_N) + delta (mod N)
-                        # X = pos_product
-                        X_val = pos_product % self.N
+                        # pos_product = neg_product * N^-e + delta
+                        # pos_product = delta (mod N)
+                        # rel_vec encodes pos_product / delta = 1
                         
                         for i, e in enumerate(exponents):
                             if e > 0: rel_vec[i+1] += e
@@ -309,14 +313,12 @@ class GeometricFactorizer:
                         X_val = 1
                         
                         if e_N > 0:
-                            X_val = neg_product % self.N
                             for i, e in enumerate(exponents):
                                 if e < 0: rel_vec[i+1] += -e
                             for i in range(d + 1):
                                 rel_vec[i] -= delta_exps[i]
                             rel_vec[0] -= 1 
                         else:
-                            X_val = pos_product % self.N
                             for i, e in enumerate(exponents):
                                 if e > 0: rel_vec[i+1] += e
                             for i in range(d + 1):
@@ -335,14 +337,12 @@ class GeometricFactorizer:
                         X_val = 1
                         
                         if e_N > 0:
-                            X_val = neg_product % self.N
                             for i, e in enumerate(exponents):
                                 if e < 0: rel_vec[i+1] += -e
                             for i in range(d + 1):
                                 rel_vec[i] -= delta_exps[i]
                             rel_vec[0] -= 1 
                         else:
-                            X_val = pos_product % self.N
                             for i, e in enumerate(exponents):
                                 if e > 0: rel_vec[i+1] += e
                             for i in range(d + 1):
@@ -417,7 +417,7 @@ class GeometricFactorizer:
             
             # Train on collected data
             for i, (basis, coeffs) in enumerate(self.successful_coeffs):
-                # Handle large integers: normalize as object array first
+                # Handle large integers: normalize as object array first (Fixes OverflowError)
                 basis_obj = np.array(basis, dtype=object)
                 max_val = np.max(np.abs(basis_obj))
                 if max_val == 0: max_val = 1
