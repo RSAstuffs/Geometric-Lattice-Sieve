@@ -417,14 +417,22 @@ class GeometricFactorizer:
             
             # Train on collected data
             for i, (basis, coeffs) in enumerate(self.successful_coeffs):
-                basis_mat = np.array(basis, dtype=np.float64)
+                # Handle large integers: normalize as object array first
+                basis_obj = np.array(basis, dtype=object)
+                max_val = np.max(np.abs(basis_obj))
+                if max_val == 0: max_val = 1
+                basis_mat = (basis_obj / max_val).astype(np.float64)
+
                 model.train(basis_mat, [coeffs], iterations=20)
                 if (i+1) % 10 == 0:
                     print(f"  Trained on {i+1}/{len(self.successful_coeffs)} samples")
             
             print("Divining new relations with Transformer...")
             # Use the FINAL reduced basis from the last pass
-            final_basis = np.array(reduced, dtype=np.float64)
+            reduced_obj = np.array(reduced, dtype=object)
+            max_val = np.max(np.abs(reduced_obj))
+            if max_val == 0: max_val = 1
+            final_basis = (reduced_obj / max_val).astype(np.float64)
             
             for _ in range(100): 
                 pred_coeffs = model.divine_coefficients(final_basis)
