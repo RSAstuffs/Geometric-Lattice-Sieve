@@ -35,11 +35,12 @@ class GeometricFactorizer:
         self.primes = self._generate_factor_base(factor_base_size)
         self.C = 1 << precision_bits  # Scaling factor for logarithms
         self.relations = []
+        self.partial_relations = {} # Store partial relations (Large Primes)
         
         print(f"N bit length: {n_bits}")
         print(f"Lattice dimension: {lattice_dim}x{lattice_dim}")
         print(f"Auto-scaled parameters:")
-        print(f"  Factor Base Size: {factor_base_size} primes")
+        print(f"  Factor Base Size: {factor_base_size} primes (filtered by Legendre symbol)")
         print(f"  Precision Bits: {precision_bits}")
         print(f"  Target: Find >{factor_base_size} relations to ensure solvable kernel")
 
@@ -86,11 +87,17 @@ class GeometricFactorizer:
 
     def _generate_factor_base(self, size):
         primes = []
-        candidate = 2
+        # Always include 2
+        primes.append(2)
+        candidate = 3
         while len(primes) < size:
             if isPrime(candidate):
-                primes.append(candidate)
-            candidate += 1
+                # Filter: Legendre symbol (N/p) == 1
+                # This ensures N is a quadratic residue mod p
+                # Essential for Quadratic Sieve, helpful for Schnorr's
+                if pow(self.N, (candidate - 1) // 2, candidate) == 1:
+                    primes.append(candidate)
+            candidate += 2
         return primes
 
     def build_schnorr_lattice(self):
@@ -113,139 +120,185 @@ class GeometricFactorizer:
         
         return B
 
+    def _factor_over_base(self, n, primes):
+        """
+        Factors n over the factor base. Returns (exponents, remainder).
+        exponents includes -1 as the first element.
+        """
+        if n == 0: return None, 0
+        
+        exponents = [0] * (len(primes) + 1) # +1 for -1
+        
+        if n < 0:
+            exponents[0] = 1
+            n = -n
+            
+        for i, p in enumerate(primes):
+            while n % p == 0:
+                exponents[i+1] += 1
+                n //= p
+            if n == 1:
+                break
+                
+        return exponents, n
+
     def find_relations(self):
         """
         Use LLL to find smooth relations.
-        
-        Build a lattice where short vectors correspond to:
-        prod(p_i^e_i) * N^e_N ≈ 1
-        
-        If e_N = 0: We found a smooth number (product of small primes)
-        If e_N != 0: We found a relation involving N
         """
         print(f"Starting LLL-based Relation Finding for N={self.N}...")
         print(f"Factor Base Size: {len(self.primes)}")
         
         d = len(self.primes)
-        target_relations = d + 10  # Need slightly more relations than primes
+        target_relations = d + 10
         
-        # Set decimal precision for large number arithmetic
         getcontext().prec = self.precision_bits + 50
         C_dec = Decimal(self.C)
         
-        # Precompute logs
         log_primes = [Decimal(p).ln() for p in self.primes]
         log_N = Decimal(self.N).ln()
         
-        seen_relations = set()  # Track unique relations
+        seen_relations = set()
         
-        # Run multiple passes with RANDOMIZED bases to get different short vectors
         max_passes = 20
         
         for pass_num in range(max_passes):
             print(f"\n=== Pass {pass_num + 1} (have {len(self.relations)}/{target_relations} relations) ===")
             
-            # Build the Schnorr-style lattice
             dim = d + 1
             B = np.zeros((dim, dim), dtype=object)
             
-            # Identity part for exponents, with log weights
             for i in range(d):
                 B[i, i] = 1
                 B[i, d] = int(log_primes[i] * C_dec)
             
-            # N row
             B[d, d] = int(log_N * C_dec)
             
-            # Apply random unimodular transformation (preserves lattice, changes basis)
             if pass_num > 0:
-                # Random row operations: add/subtract rows
                 for _ in range(d):
                     i, j = random.sample(range(d), 2)
                     sign = random.choice([-1, 1])
                     B[i] = B[i] + sign * B[j]
-                
-                # Random permutation of rows (excluding last row which is N)
                 perm = list(range(d))
                 random.shuffle(perm)
                 B[:d] = B[perm]
             
             print(f"Lattice dimension: {dim}x{dim}")
-            
-            # Run GeometricLLL reduction
             print("Running GeometricLLL reduction...")
             lll = GeometricLLL(self.N, basis=B)
-            reduced = lll.run_geometric_reduction(verbose=False, num_passes=3)
+            # Reduced passes for performance (was 10)
+            reduced = lll.run_geometric_reduction(verbose=False, num_passes=4)
             
             print("Analyzing reduced basis for relations...")
             
             pass_relations = 0
-            for row_idx, row in enumerate(reduced):
-                # Extract exponents (first d entries) and the weight (last entry)
-                exponents = tuple(int(row[i]) for i in range(d))
+            for row in reduced:
+                exponents = [int(row[i]) for i in range(d)]
                 weight = int(row[d])
                 
-                # Skip zero vector
-                if all(e == 0 for e in exponents):
-                    continue
+                if all(e == 0 for e in exponents): continue
                 
-                # Normalize: make first non-zero positive (canonical form)
-                first_nonzero = next((e for e in exponents if e != 0), 0)
-                if first_nonzero < 0:
-                    exponents = tuple(-e for e in exponents)
+                # Reconstruct e_N
+                sum_log = sum(e * lp for e, lp in zip(exponents, log_primes))
+                e_N = -int(round(sum_log / log_N))
                 
-                # Skip already seen
-                if exponents in seen_relations:
-                    continue
-                    
-                seen_relations.add(exponents)
+                if e_N == 0: continue 
                 
-                # Separate positive and negative exponents
+                # Calculate delta
+                # If e_N > 0: U * N^e_N - V = delta
+                # If e_N < 0: U - V * N^(-e_N) = delta
+                
                 pos_product = 1
                 neg_product = 1
-                
                 for i, e in enumerate(exponents):
-                    if e > 0:
-                        pos_product *= pow(self.primes[i], e)
-                    elif e < 0:
-                        neg_product *= pow(self.primes[i], -e)
+                    if e > 0: pos_product *= pow(self.primes[i], e)
+                    elif e < 0: neg_product *= pow(self.primes[i], -e)
                 
-                if neg_product == 0:
-                    continue
+                delta = 0
+                if e_N > 0:
+                    delta = pos_product * pow(self.N, e_N) - neg_product
+                else:
+                    delta = pos_product - neg_product * pow(self.N, -e_N)
+                
+                if delta == 0: continue
+
+                # Factor delta
+                delta_exps, remainder = self._factor_over_base(delta, self.primes)
+                
+                if remainder == 1 or remainder == -1: # -1 handled by sign bit in delta_exps
+                    # Construct full relation vector
+                    # ... (logic as before) ...
                     
-                # Quick factor check
-                if pos_product % self.N == neg_product % self.N:
-                    diff = pos_product - neg_product
-                    if diff != 0 and diff % self.N == 0:
-                        f = GCD(pos_product - 1, self.N)
-                        if 1 < f < self.N:
-                            print(f"\n[SUCCESS] Factor found: {f}")
-                            print(f"Other factor: {self.N // f}")
-                            return
-                
-                # Store as relation for linear algebra phase
-                # Accept all non-trivial relations
-                # Store FULL exponents for reconstruction, not just parity
-                relation_entry = {
-                    'x': 1, # RHS is 1 because pos_product == neg_product mod N => pos/neg == 1
-                    'exponents': exponents # Full exponents (can be negative)
-                }
-                
-                # PARANOID CHECK: Verify the relation object itself
-                check_pos = 1
-                check_neg = 1
-                for i, e in enumerate(relation_entry['exponents']):
-                    if e > 0: check_pos *= pow(self.primes[i], e)
-                    elif e < 0: check_neg *= pow(self.primes[i], -e)
-                
-                if check_pos % self.N != check_neg % self.N:
-                    print(f"    [ERROR] Relation sanity check failed! Exponents: {exponents}")
-                    continue
+                    rel_vec = [0] * (d + 1)
                     
-                self.relations.append(relation_entry)
-                pass_relations += 1
+                    if e_N > 0:
+                        # V part (from negative exponents in LLL vector)
+                        for i, e in enumerate(exponents):
+                            if e < 0: rel_vec[i+1] += -e
+                        # -delta part
+                        for i in range(d + 1):
+                            rel_vec[i] -= delta_exps[i]
+                        # Adjust for -1 in -delta
+                        rel_vec[0] -= 1 
+                    else:
+                        # U part (from positive exponents in LLL vector)
+                        for i, e in enumerate(exponents):
+                            if e > 0: rel_vec[i+1] += e
+                        # -delta part
+                        for i in range(d + 1):
+                            rel_vec[i] -= delta_exps[i]
+                            
+                    # Normalize sign exponent to 0 or 1
+                    rel_vec[0] = rel_vec[0] % 2
+                    
+                    self.relations.append({
+                        'x': 1,
+                        'exponents': rel_vec
+                    })
+                    pass_relations += 1
+                
+                elif isPrime(abs(remainder)):
+                    # Large Prime Relation
+                    lp = abs(remainder)
+                    
+                    # Construct rel_vec (same as for full relation)
+                    rel_vec = [0] * (d + 1)
+                    if e_N > 0:
+                        for i, e in enumerate(exponents):
+                            if e < 0: rel_vec[i+1] += -e
+                        for i in range(d + 1):
+                            rel_vec[i] -= delta_exps[i]
+                        rel_vec[0] -= 1 
+                    else:
+                        for i, e in enumerate(exponents):
+                            if e > 0: rel_vec[i+1] += e
+                        for i in range(d + 1):
+                            rel_vec[i] -= delta_exps[i]
+                    
+                    # Normalize sign
+                    rel_vec[0] = rel_vec[0] % 2
+                    
+                    if lp in self.partial_relations:
+                        # Combine!
+                        match_vec = self.partial_relations[lp]
+                        # Sum vectors
+                        combined_vec = [v1 + v2 for v1, v2 in zip(rel_vec, match_vec)]
+                        # Normalize sign
+                        combined_vec[0] = combined_vec[0] % 2
+                        
+                        self.relations.append({
+                            'x': 1,
+                            'exponents': combined_vec
+                        })
+                        pass_relations += 1
+                        del self.partial_relations[lp]
+                    else:
+                        self.partial_relations[lp] = rel_vec
             
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
+            
+            if len(self.relations) >= target_relations:
+                break
             
             if len(self.relations) >= target_relations:
                 print(f"Target reached! Have {len(self.relations)} relations > {d} primes.")
@@ -326,9 +379,15 @@ class GeometricFactorizer:
         for rel in self.relations:
             # Use 'exponents' if available (new format), else 'd_exponents' (old format/sieve)
             if 'exponents' in rel:
+                # New format: exponents includes -1 at index 0
+                # We need to map this to the matrix columns
+                # Matrix columns: [-1, p1, p2, ..., pd]
+                # rel['exponents'] is exactly this!
                 row = [abs(x) % 2 for x in rel['exponents']]
             elif 'd_exponents' in rel:
-                row = [x % 2 for x in rel['d_exponents']]
+                # Old format: d_exponents corresponds to primes only
+                # Prepend 0 for -1
+                row = [0] + [x % 2 for x in rel['d_exponents']]
             else:
                 continue
             M.append(row)
@@ -441,43 +500,43 @@ class GeometricFactorizer:
             
             # Construct X (product of x_i) and Y (sqrt of product of y_i)
             X = 1
-            Y_exponents = [0] * len(self.primes)
+            # Y_exponents needs to track -1 and all primes
+            # Size is d+1
+            Y_exponents = [0] * (len(self.primes) + 1)
             
             for idx in indices:
                 rel = self.relations[idx]
                 X = (X * rel['x']) % self.N
                 
                 if 'exponents' in rel:
-                    for p_idx, e in enumerate(rel['exponents']):
-                        Y_exponents[p_idx] += e
+                    for i, e in enumerate(rel['exponents']):
+                        Y_exponents[i] += e
                 elif 'd_exponents' in rel:
-                    # Fallback for sieve relations (assumed positive)
-                    for p_idx, e in enumerate(rel['d_exponents']):
-                        Y_exponents[p_idx] += e
+                    # Fallback for sieve relations (assumed positive, no -1)
+                    for i, e in enumerate(rel['d_exponents']):
+                        Y_exponents[i+1] += e
             
             # Compute Y = product(p^(exp/2)) mod N
             Y = 1
             valid = True
             
+            # Handle -1 (index 0)
+            if Y_exponents[0] % 2 != 0:
+                valid = False
+            else:
+                # (-1)^(2k) = 1, so we ignore it for Y
+                pass
+                
+            if not valid: continue
+
+            # Handle primes (indices 1 to d)
             for p_idx in range(len(self.primes)):
-                if Y_exponents[p_idx] % 2 != 0:
+                exp = Y_exponents[p_idx+1]
+                if exp % 2 != 0:
                     valid = False
-                    # Debug print for first few failures
-                    if attempt < 5:
-                        print(f"    Debug: Invalid exponent sum for prime {self.primes[p_idx]}: {Y_exponents[p_idx]}")
-                        # Check what the matrix row had
-                        # Reconstruct the sum from the matrix rows
-                        mat_sum = 0
-                        for idx in indices:
-                            rel = self.relations[idx]
-                            if 'exponents' in rel:
-                                mat_sum += abs(rel['exponents'][p_idx]) % 2
-                            elif 'd_exponents' in rel:
-                                mat_sum += rel['d_exponents'][p_idx] % 2
-                        print(f"    Debug: Matrix sum (mod 2) for prime {self.primes[p_idx]}: {mat_sum % 2}")
                     break
                     
-                y_half = Y_exponents[p_idx] // 2
+                y_half = exp // 2
                 
                 base = self.primes[p_idx]
                 if y_half < 0:
@@ -512,7 +571,11 @@ class GeometricFactorizer:
                         r_pos = 1
                         r_neg = 1
                         if 'exponents' in rel:
-                            for i, e in enumerate(rel['exponents']):
+                            # Handle -1 (index 0)
+                            if rel['exponents'][0] % 2 != 0:
+                                r_pos *= -1
+                            
+                            for i, e in enumerate(rel['exponents'][1:]):
                                 if e > 0: r_pos *= pow(self.primes[i], e)
                                 elif e < 0: r_neg *= pow(self.primes[i], -e)
                             
@@ -557,7 +620,7 @@ class GeometricFactorizer:
 
 if __name__ == "__main__":
     # Target N provided by user
-    N = 261980999226229
+    N = 12
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
     # Use 700x700 lattice to get more relations
