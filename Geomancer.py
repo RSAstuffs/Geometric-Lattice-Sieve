@@ -7,6 +7,7 @@ import random
 import copy
 from functools import reduce
 from decimal import Decimal, getcontext
+from scipy.spatial import Delaunay
 
 def jacobi_symbol(a, n):
     """
@@ -165,6 +166,63 @@ class GeometricFactorizer:
                 break
                 
         return exponents, n
+
+    def _point_in_triangle(self, point, triangle):
+        """Check if a point is inside a triangle using barycentric coordinates."""
+        p = point
+        a, b, c = triangle
+        
+        # Compute barycentric coordinates
+        denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+        if abs(denom) < 1e-10:
+            return False  # Degenerate triangle
+        
+        alpha = ((b[1] - c[1]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[1])) / denom
+        beta = ((c[1] - a[1]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[1])) / denom
+        gamma = 1 - alpha - beta
+        
+        return 0 <= alpha <= 1 and 0 <= beta <= 1 and 0 <= gamma <= 1
+
+    def _distance_to_triangle(self, point, triangle):
+        """Compute minimum distance from point to triangle."""
+        p = point
+        a, b, c = triangle
+        
+        # Check distance to each edge
+        edges = [(a, b), (b, c), (c, a)]
+        min_dist = float('inf')
+        
+        for edge_start, edge_end in edges:
+            dist = self._point_to_line_distance(p, edge_start, edge_end)
+            min_dist = min(min_dist, dist)
+        
+        return min_dist
+
+    def _point_to_line_distance(self, point, line_start, line_end):
+        """Compute distance from point to line segment."""
+        p = np.array(point)
+        a = np.array(line_start)
+        b = np.array(line_end)
+        
+        # Vector from a to b
+        ab = b - a
+        # Vector from a to p
+        ap = p - a
+        
+        # Projection scalar
+        proj = np.dot(ap, ab)
+        len2 = np.dot(ab, ab)
+        
+        if len2 == 0:
+            return np.linalg.norm(p - a)
+        
+        # Clamp projection to line segment
+        t = max(0, min(1, proj / len2))
+        
+        # Closest point on line segment
+        closest = a + t * ab
+        
+        return np.linalg.norm(p - closest)
 
     def find_relations(self):
         """
@@ -937,6 +995,54 @@ class GeometricFactorizer:
                             mask[idx] = 1
                             selected_indices.append(idx)
                         yield mask, "Phase2_Geometric", f"angle_{int(angle*180/math.pi)}deg_top{num_combine}_start{start_idx}"
+            
+            # Phase 2.5: Triangulation-based search for large kernels
+            if kernel_size > 50 and len(kernel_2d) >= 3:
+                print("  Phase 2.5: Triangulation-based divination...")
+                try:
+                    # Convert to numpy array for triangulation
+                    points = np.array(kernel_2d)
+                    
+                    # Compute Delaunay triangulation
+                    tri = Delaunay(points)
+                    
+                    # Find triangles that contain or are near the origin
+                    origin = np.array([0.0, 0.0])
+                    triangles_of_interest = []
+                    
+                    for simplex in tri.simplices:
+                        triangle_points = points[simplex]
+                        
+                        # Check if origin is inside this triangle
+                        if self._point_in_triangle(origin, triangle_points):
+                            triangles_of_interest.append((simplex, "contains_origin"))
+                        else:
+                            # Check distance from origin to triangle
+                            dist = self._distance_to_triangle(origin, triangle_points)
+                            if dist < 0.1:  # Close to origin
+                                triangles_of_interest.append((simplex, f"near_origin_{dist:.3f}"))
+                    
+                    # Sort by priority (containing origin first, then closest)
+                    triangles_of_interest.sort(key=lambda x: 0 if x[1] == "contains_origin" else float(x[1].split('_')[2]))
+                    
+                    # Generate combinations from triangles
+                    for simplex, reason in triangles_of_interest[:min(20, len(triangles_of_interest))]:
+                        # Try the full triangle
+                        mask = [0] * len(kernel_basis)
+                        for idx in simplex:
+                            mask[idx] = 1
+                        yield mask, "Phase2.5_Triangle", f"triangle_{simplex[0]}_{simplex[1]}_{simplex[2]}_{reason}"
+                        
+                        # Try pairs from the triangle
+                        for i in range(3):
+                            for j in range(i+1, 3):
+                                mask = [0] * len(kernel_basis)
+                                mask[simplex[i]] = 1
+                                mask[simplex[j]] = 1
+                                yield mask, "Phase2.5_Triangle", f"pair_{simplex[i]}_{simplex[j]}_from_triangle_{reason}"
+                
+                except Exception as e:
+                    print(f"    Triangulation failed: {e}")
             
             # Phase 3: Random combinations (fallback)
             print("  Phase 3: Checking random combinations...")
