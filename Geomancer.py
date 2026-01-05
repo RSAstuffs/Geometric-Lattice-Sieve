@@ -312,6 +312,10 @@ class GeometricFactorizer:
                     if is_lhs_one or is_rhs_one:
                         # print("    Debug: Skipping trivial relation (X=1 or Y=1)")
                         valid_rel = False
+                    
+                    # Check if LHS == RHS (X == Y)
+                    if lhs_vec == rhs_vec:
+                        valid_rel = False
                         
                     if valid_rel:
                         self.relations.append({
@@ -860,10 +864,35 @@ class GeometricFactorizer:
 
 if __name__ == "__main__":
     # Target N provided by user
-    N = 2021
+    # N = 2021
+    # For 2048-bit testing (example)
+    # N = ...
+    
+    # Let's use a generated 2048-bit number or the user's input
+    # For now, we'll stick to the user's N=2021 for testing, but add logic for scaling
+    
+    # Example: 60-bit number
+    # N = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+    
+    # If user wants to test 2048-bit, they should set N here.
+    # We will auto-scale lattice_dim based on N.
+    
+    N = 2021 # Default test
+    
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
-    # Use 700x700 lattice to get more relations
-    factorizer = GeometricFactorizer(N, lattice_dim=50)
+    # Auto-scale lattice dimension
+    if N.bit_length() > 1000:
+        lattice_dim = 300 # Minimum for large numbers
+    elif N.bit_length() > 500:
+        lattice_dim = 200
+    elif N.bit_length() > 100:
+        lattice_dim = 100
+    else:
+        lattice_dim = 50
+        
+    print(f"Using lattice dimension: {lattice_dim}")
+    
+    factorizer = GeometricFactorizer(N, lattice_dim=lattice_dim)
     factorizer.find_relations()
     factorizer.solve_linear_system()
