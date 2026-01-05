@@ -780,29 +780,68 @@ class GeometricFactorizer:
         print(f"  Attempting to find non-trivial factors from {len(kernel_basis)} dependencies...")
         print(f"  Using geometric projection to divine factor directions...")
         
-        # Project kernel basis to 2D using simple random projection
-        # Each kernel vector becomes a 2D point
+        # Project kernel basis to 2D using improved projection
         kernel_dim = len(kernel_basis)
         
-        # Random projection vectors
-        proj1 = [random.gauss(0, 1) for _ in range(len(valid_indices))]
-        proj2 = [random.gauss(0, 1) for _ in range(len(valid_indices))]
-        
-        # Normalize
-        norm1 = math.sqrt(sum(x*x for x in proj1))
-        norm2 = math.sqrt(sum(x*x for x in proj2))
-        proj1 = [x/norm1 for x in proj1]
-        proj2 = [x/norm2 for x in proj2]
-        
-        # Project each kernel vector
-        kernel_2d = []
-        for kb in kernel_basis:
-            x = sum(kb[i] * proj1[i] for i in range(len(kb)))
-            y = sum(kb[i] * proj2[i] for i in range(len(kb)))
-            kernel_2d.append((x, y))
+        if kernel_dim <= 2:
+            # For small kernels, just use the vectors directly
+            kernel_2d = [(float(kb[0]) if len(kb) > 0 else 0, float(kb[1]) if len(kb) > 1 else 0) for kb in kernel_basis]
+        else:
+            # Use PCA-like projection: find directions of maximum variance
+            # Compute covariance matrix of kernel vectors
+            kernel_matrix = [[float(x) for x in kb] for kb in kernel_basis]
+            
+            # Find principal components (simplified PCA)
+            # Compute mean
+            means = [sum(row[i] for row in kernel_matrix) / len(kernel_matrix) for i in range(len(kernel_matrix[0]))]
+            
+            # Center the data
+            centered = [[row[i] - means[i] for i in range(len(row))] for row in kernel_matrix]
+            
+            # Compute covariance matrix (simplified)
+            cov = [[0] * len(means) for _ in range(len(means))]
+            for row in centered:
+                for i in range(len(row)):
+                    for j in range(len(row)):
+                        cov[i][j] += row[i] * row[j]
+            for i in range(len(cov)):
+                for j in range(len(cov)):
+                    cov[i][j] /= len(centered)
+            
+            # Find eigenvector of largest eigenvalue (power iteration)
+            v = [1.0] * len(means)
+            for _ in range(10):  # 10 iterations
+                v_new = [sum(cov[i][j] * v[j] for j in range(len(v))) for i in range(len(v))]
+                norm = math.sqrt(sum(x*x for x in v_new))
+                if norm > 0:
+                    v = [x/norm for x in v_new]
+            
+            proj1 = v
+            
+            # Find second principal component (orthogonal to first)
+            # Gram-Schmidt
+            proj2 = [1.0] * len(means)
+            dot = sum(proj2[i] * proj1[i] for i in range(len(proj1)))
+            proj2 = [proj2[i] - dot * proj1[i] for i in range(len(proj1))]
+            norm = math.sqrt(sum(x*x for x in proj2))
+            if norm > 0:
+                proj2 = [x/norm for x in proj2]
+            
+            # Project each kernel vector
+            kernel_2d = []
+            for kb in kernel_basis:
+                x = sum(kb[i] * proj1[i] for i in range(len(kb)))
+                y = sum(kb[i] * proj2[i] for i in range(len(kb)))
+                kernel_2d.append((x, y))
         
         # We will try up to max_attempts total checks
-        max_attempts = 5000
+        kernel_size = len(kernel_basis)
+        if kernel_size <= 20:
+            max_attempts = 5000
+        elif kernel_size <= 100:
+            max_attempts = 10000
+        else:
+            max_attempts = 20000  # More attempts for very large kernels
         trivial_count = 0
         
         # Generator to yield masks (linear combinations of kernel basis)
@@ -815,14 +854,62 @@ class GeometricFactorizer:
                 mask[i] = 1
                 yield mask, "Phase1_Single", f"basis_vector_{i}"
             
-            # Phase 2: Aggressive Geometric search - extensive direction-based combinations
-            print("  Phase 2: Aggressive geometric divination along projected directions...")
-            # Try many more combinations that lie along "rays" from origin in 2D space
-            num_angles = 72  # 5 degree increments for finer resolution
-            max_combine = min(8, len(kernel_basis))  # Try up to 8 vectors per combination
+            # Phase 2: Adaptive Geometric search - focus on dense regions
+            print("  Phase 2: Adaptive geometric divination along projected directions...")
             
-            for angle_idx in range(num_angles):
-                angle = angle_idx * math.pi / (num_angles // 2)  # Full circle
+            # Scale search parameters based on kernel size
+            kernel_size = len(kernel_basis)
+            if kernel_size <= 10:
+                num_angles = 72
+                max_combine = min(8, kernel_size)
+                max_start_positions = 3
+            elif kernel_size <= 50:
+                num_angles = 48
+                max_combine = min(6, kernel_size)
+                max_start_positions = 2
+            else:
+                num_angles = 24  # Reduce for very large kernels
+                max_combine = min(4, kernel_size)
+                max_start_positions = 1
+            
+            # Find directions with high point density (adaptive angle selection)
+            angles_to_try = []
+            
+            # Always include cardinal directions
+            angles_to_try.extend([0, math.pi/2, math.pi, 3*math.pi/2])
+            
+            # Add directions toward clusters of points
+            if len(kernel_2d) > 5:
+                # Compute angles of all points from origin
+                point_angles = []
+                for x, y in kernel_2d:
+                    if x != 0 or y != 0:
+                        angle = math.atan2(y, x)
+                        if angle < 0:
+                            angle += 2 * math.pi
+                        point_angles.append(angle)
+                
+                # Find dense regions (simple clustering)
+                if point_angles:
+                    point_angles.sort()
+                    # Look for gaps larger than average
+                    gaps = []
+                    for i in range(len(point_angles)):
+                        next_i = (i + 1) % len(point_angles)
+                        gap = (point_angles[next_i] - point_angles[i]) % (2 * math.pi)
+                        gaps.append((gap, point_angles[i]))
+                    
+                    gaps.sort(reverse=True)
+                    # Add angles in the largest gaps (where clusters might be)
+                    for gap_size, angle in gaps[:min(8, len(gaps)//2)]:
+                        if gap_size > math.pi / 6:  # Only if gap is significant
+                            cluster_angle = (angle + gap_size/2) % (2 * math.pi)
+                            angles_to_try.append(cluster_angle)
+            
+            # Ensure we don't have too many angles
+            angles_to_try = angles_to_try[:num_angles]
+            
+            for angle in angles_to_try:
                 direction = (math.cos(angle), math.sin(angle))
                 
                 # Find kernel vectors that align with this direction
@@ -843,13 +930,13 @@ class GeometricFactorizer:
                 # Try various combination sizes, prioritizing higher alignment scores
                 for num_combine in range(1, max_combine + 1):
                     # Try the top N for this combination size
-                    for start_idx in range(min(3, len(scores) - num_combine + 1)):  # Try first 3 starting positions
+                    for start_idx in range(min(max_start_positions, len(scores) - num_combine + 1)):
                         mask = [0] * len(kernel_basis)
                         selected_indices = []
                         for _, idx in scores[start_idx:start_idx + num_combine]:
                             mask[idx] = 1
                             selected_indices.append(idx)
-                        yield mask, "Phase2_Geometric", f"angle_{angle_idx*5}deg_top{num_combine}_start{start_idx}"
+                        yield mask, "Phase2_Geometric", f"angle_{int(angle*180/math.pi)}deg_top{num_combine}_start{start_idx}"
             
             # Phase 3: Random combinations (fallback)
             print("  Phase 3: Checking random combinations...")
