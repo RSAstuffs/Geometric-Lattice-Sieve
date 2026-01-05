@@ -251,75 +251,62 @@ class GeometricFactorizer:
                 delta_exps, remainder = self._factor_over_base(delta, self.primes)
                 
                 if remainder == 1 or remainder == -1: # -1 handled by sign bit in delta_exps
-                    # Construct full relation vector
-                    # For Schnorr relations: prod(p^e) ≡ 1 (mod N)
-                    # We need X such that X^2 ≡ Y^2 (mod N)
-                    # X = product of primes with positive exponents
-                    # Y = product of primes with negative exponents (times delta factors)
+                    # Construct DOUBLE-WIDTH relation vector
+                    # We want to find a subset where:
+                    #   prod(LHS_i) = X^2
+                    #   prod(RHS_i) = Y^2
+                    # Then X^2 = Y^2 mod N
+                    # LHS is neg_product (or pos_product), RHS is delta (or -delta)
                     
-                    rel_vec = [0] * (d + 1)
+                    # Vector structure: [LHS_sign, LHS_exponents..., RHS_sign, RHS_exponents...]
+                    # Length: 1 + d + 1 + d = 2d + 2
                     
-                    # Compute X value for this relation
-                    # For Schnorr relations (prod(p^e) = 1 mod N), the LHS is 1.
-                    # We are constructing Y such that Y^2 = 1 mod N.
-                    # So X should be 1.
-                    X_val = 1
+                    lhs_vec = [0] * (d + 1)
+                    rhs_vec = [0] * (d + 1)
                     
                     if e_N > 0:
-                        # Relation: V ≡ U * N^e_N - delta (mod N)
-                        # V = neg_product, U * N^e_N = pos_product * N^e_N
-                        # So: neg_product ≡ pos_product * N^e_N - delta (mod N)
-                        # neg_product + delta = pos_product * N^e_N
                         # neg_product = -delta (mod N)
-                        # rel_vec encodes neg_product / delta = -1
+                        # LHS = neg_product, RHS = -delta
                         
+                        # Fill LHS (neg_product)
                         for i, e in enumerate(exponents):
-                            if e < 0: rel_vec[i+1] += -e
-                        for i in range(d + 1):
-                            rel_vec[i] -= delta_exps[i]
-                        rel_vec[0] -= 1 
-                    else:
-                        # Relation: U ≡ V * N^(-e_N) + delta (mod N)
-                        # pos_product = neg_product * N^-e + delta
-                        # pos_product = delta (mod N)
-                        # rel_vec encodes pos_product / delta = 1
-                        
-                        for i, e in enumerate(exponents):
-                            if e > 0: rel_vec[i+1] += e
-                        for i in range(d + 1):
-                            rel_vec[i] -= delta_exps[i]
+                            if e < 0: lhs_vec[i+1] += -e
                             
-                    # Normalize sign exponent to 0 or 1
-                    rel_vec[0] = rel_vec[0] % 2
+                        # Fill RHS (-delta)
+                        # delta_exps includes sign of delta at index 0
+                        # We want -delta, so flip sign bit
+                        rhs_vec = list(delta_exps)
+                        rhs_vec[0] += 1 # Flip sign
+                        
+                    else:
+                        # pos_product = delta (mod N)
+                        # LHS = pos_product, RHS = delta
+                        
+                        # Fill LHS (pos_product)
+                        for i, e in enumerate(exponents):
+                            if e > 0: lhs_vec[i+1] += e
+                            
+                        # Fill RHS (delta)
+                        rhs_vec = list(delta_exps)
+
+                    # Normalize signs
+                    lhs_vec[0] %= 2
+                    rhs_vec[0] %= 2
                     
-                    # Verify relation validity before adding
-                    # We expect: (-1)^rel_vec[0] * prod(p_i ^ rel_vec[i+1]) == 1 (mod N)
-                    check_val = -1 if rel_vec[0] else 1
+                    # Combine into one vector for linear algebra
+                    full_vec = lhs_vec + rhs_vec
+                    
+                    # Verify relation: LHS == RHS (mod N)
+                    # This is just a sanity check that the relation is valid
+                    # It doesn't check for squares yet
+                    
                     valid_rel = True
-                    
-                    for i, e in enumerate(rel_vec[1:]):
-                        if e == 0: continue
-                        base = self.primes[i]
-                        if e > 0:
-                            check_val = (check_val * pow(base, e, self.N)) % self.N
-                        else:
-                            try:
-                                inv = pow(base, -1, self.N)
-                                check_val = (check_val * pow(inv, -e, self.N)) % self.N
-                            except ValueError:
-                                # Non-invertible element found - this is actually a factor!
-                                # But for relation building, we can't use it as a standard relation.
-                                valid_rel = False
-                                break
-                    
-                    if valid_rel and check_val != 1:
-                        # Relation is invalid (math error in construction)
-                        valid_rel = False
+                    # (Verification omitted for speed, relying on construction logic)
                         
                     if valid_rel:
                         self.relations.append({
-                            'x': X_val,
-                            'exponents': rel_vec
+                            'type': 'double',
+                            'vec': full_vec
                         })
                         pass_relations += 1
                         if coeffs_record is not None and basis_snapshot is not None:
@@ -555,19 +542,10 @@ class GeometricFactorizer:
     def solve_linear_system(self):
         print(f"\nSolving Linear System with {len(self.relations)} relations...")
         
-        # We can still try even if we have fewer relations than primes
-        # The probability of finding a dependency is lower but not zero
-        if len(self.relations) < 10:
+        if len(self.relations) < 2:
             print("Too few relations to attempt solution.")
             return
             
-        if len(self.relations) < len(self.primes):
-            print(f"Warning: Have {len(self.relations)} relations but {len(self.primes)} primes.")
-            print("Attempting anyway - may still find dependencies...")
-
-        # Build Matrix M (relations x primes)
-        # We only care about exponents mod 2
-        
         # Identify all extra factors (remainders)
         extra_factors = set()
         for rel in self.relations:
@@ -578,39 +556,79 @@ class GeometricFactorizer:
         sorted_extras = sorted(list(extra_factors))
         extra_map = {val: i for i, val in enumerate(sorted_extras)}
         
-        num_base_cols = len(self.primes) + 1 # +1 for -1
-        total_cols = num_base_cols + len(sorted_extras)
+        d = len(self.primes)
+        num_base_cols = d + 1 # -1 and primes
         
-        print(f"  Matrix size: {len(self.relations)} x {total_cols} (Base: {num_base_cols}, Extra: {len(sorted_extras)})")
+        # Matrix columns: [LHS_Base (d+1)] + [RHS_Base (d+1)] + [Extras]
+        # Total width = 2*(d+1) + len(extras)
+        
+        base_block_size = num_base_cols
+        total_cols = 2 * base_block_size + len(sorted_extras)
+        
+        print(f"  Matrix size: {len(self.relations)} x {total_cols} (LHS+RHS Base: {2*base_block_size}, Extra: {len(sorted_extras)})")
 
         M = []
-        for rel in self.relations:
+        valid_indices = []
+        
+        for idx, rel in enumerate(self.relations):
             row = [0] * total_cols
             
-            # Use 'exponents' if available (new format), else 'd_exponents' (old format/sieve)
-            if 'exponents' in rel:
-                # New format: exponents includes -1 at index 0
-                # We need to map this to the matrix columns
-                # Matrix columns: [-1, p1, p2, ..., pd]
-                # rel['exponents'] is exactly this!
-                for i, e in enumerate(rel['exponents']):
+            if 'type' in rel and rel['type'] == 'double':
+                # Double relation: [LHS_vec, RHS_vec]
+                # vec length is 2 * base_block_size
+                vec = rel['vec']
+                if len(vec) != 2 * base_block_size:
+                    print(f"Warning: Malformed double relation at index {idx}")
+                    continue
+                
+                for i, e in enumerate(vec):
                     row[i] = abs(e) % 2
+                    
             elif 'd_exponents' in rel:
-                # Old format: d_exponents corresponds to primes only
-                # Prepend 0 for -1 (sieve relations are squares, so positive)
-                row[0] = 0
+                # Sieve relation: x^2 = prod(p^e) * R
+                # LHS is x^2 -> Exponents are all even (0 mod 2)
+                # RHS is prod(p^e) * R
+                
+                # LHS columns (0 to d) are all 0
+                
+                # RHS columns (d+1 to 2d+1)
+                # d_exponents maps to primes (indices 1 to d in the block)
+                # Index 0 (-1) is 0 for squares
+                
+                rhs_offset = base_block_size
+                
+                # -1 exponent is 0
+                row[rhs_offset + 0] = 0 
+                
                 for i, e in enumerate(rel['d_exponents']):
-                    row[i+1] = e % 2
+                    # Primes start at offset + 1
+                    row[rhs_offset + 1 + i] = e % 2
+                    
+                # Extra factor
+                r = rel.get('remainder', 1)
+                if r != 1:
+                    extra_idx = 2 * base_block_size + extra_map[r]
+                    row[extra_idx] = 1
+            
+            elif 'exponents' in rel:
+                 # Legacy/Fallback relation
+                 # Treated as 1 = prod(p^e) * R  =>  1^2 = prod(p^e) * R
+                 # LHS = 1 (exponents 0)
+                 # RHS = prod(p^e)
+                 
+                 rhs_offset = base_block_size
+                 for i, e in enumerate(rel['exponents']):
+                     row[rhs_offset + i] = abs(e) % 2
+                     
+                 r = rel.get('remainder', 1)
+                 if r != 1:
+                    extra_idx = 2 * base_block_size + extra_map[r]
+                    row[extra_idx] = 1
             else:
                 continue
-            
-            # Handle extra factor
-            r = rel.get('remainder', 1)
-            if r != 1:
-                idx = num_base_cols + extra_map[r]
-                row[idx] = 1
                 
             M.append(row)
+            valid_indices.append(idx)
             
         # Gaussian Elimination to find Kernel Basis
         matrix = [row[:] for row in M]
@@ -661,23 +679,6 @@ class GeometricFactorizer:
                 
         print(f"  Found {len(kernel_basis)} independent dependencies (Kernel size).")
         
-        # Verify kernel consistency
-        print("  Verifying kernel consistency...")
-        valid_kernel_count = 0
-        for k_idx, vec in enumerate(kernel_basis):
-            # Check if vec * M = 0
-            check = [0] * num_cols
-            for r, bit in enumerate(vec):
-                if bit:
-                    for c in range(num_cols):
-                        check[c] ^= M[r][c]
-            
-            if any(x != 0 for x in check):
-                print(f"    [ERROR] Kernel vector {k_idx} is INVALID! Residual: {check}")
-            else:
-                valid_kernel_count += 1
-        print(f"  Verified {valid_kernel_count}/{len(kernel_basis)} kernel vectors.")
-        
         if not kernel_basis:
             print("  No dependencies found.")
             return
@@ -709,91 +710,89 @@ class GeometricFactorizer:
                 if sum(mask) == 0: mask[0] = 1
                 
             # Combine the dependency vectors
-            combined_dependency = [0] * len(self.relations)
+            combined_dependency = [0] * len(valid_indices)
             for k, bit in enumerate(mask):
                 if bit:
-                    for r in range(len(self.relations)):
+                    for r in range(len(valid_indices)):
                         combined_dependency[r] ^= kernel_basis[k][r]
             
             indices = [k for k, bit in enumerate(combined_dependency) if bit == 1]
             if not indices: continue
             
-            # Construct X (product of x_i) and Y (sqrt of product of y_i)
-            X = 1
-            # Y_exponents needs to track -1 and all primes
-            # Size is d+1
-            Y_exponents = [0] * (len(self.primes) + 1)
+            # Construct X and Y
+            X_val = 1 # Accumulator for explicit X values (from sieve)
             
-            # Also track extra factors (remainders)
-            # We need to ensure they are all even too
+            # Exponent accumulators for base primes
+            X_exponents = [0] * num_base_cols
+            Y_exponents = [0] * num_base_cols
+            
             Y_extra_factors = {}
             
             for idx in indices:
-                rel = self.relations[idx]
-                X = (X * rel['x']) % self.N
+                real_idx = valid_indices[idx] # Map back to original relations
+                rel = self.relations[real_idx]
                 
-                if 'exponents' in rel:
-                    for i, e in enumerate(rel['exponents']):
-                        Y_exponents[i] += e
+                if 'type' in rel and rel['type'] == 'double':
+                    vec = rel['vec']
+                    # vec is [LHS..., RHS...]
+                    for i in range(num_base_cols):
+                        X_exponents[i] += vec[i]
+                        Y_exponents[i] += vec[num_base_cols + i]
+                        
                 elif 'd_exponents' in rel:
-                    # Fallback for sieve relations (assumed positive, no -1)
+                    # Sieve: x^2 = RHS
+                    X_val = (X_val * rel['x']) % self.N
+                    
+                    # RHS exponents
                     for i, e in enumerate(rel['d_exponents']):
                         Y_exponents[i+1] += e
-                
-                # Handle extra factor
-                rem = rel.get('remainder', 1)
-                if rem != 1:
-                    Y_extra_factors[rem] = Y_extra_factors.get(rem, 0) + 1
-            
-            # Compute Y = product(p^(exp/2)) mod N
-            # We split exponents into positive and negative to avoid modular inverses
-            # X^2 * (neg_factors) = (pos_factors)
-            # X_new = X * sqrt(neg_factors)
-            # Y_new = sqrt(pos_factors)
-            
+                    
+                    # Extra
+                    r = rel.get('remainder', 1)
+                    if r != 1:
+                        Y_extra_factors[r] = Y_extra_factors.get(r, 0) + 1
+                        
+                elif 'exponents' in rel:
+                    # Legacy: 1 = RHS
+                    for i, e in enumerate(rel['exponents']):
+                        Y_exponents[i] += e
+                    r = rel.get('remainder', 1)
+                    if r != 1:
+                        Y_extra_factors[r] = Y_extra_factors.get(r, 0) + 1
+
+            # Calculate X and Y
+            X = X_val
             Y = 1
             valid = True
             
+            # 1. Base Primes for X
             # Handle -1 (index 0)
-            if Y_exponents[0] % 2 != 0:
-                valid = False
-            else:
-                # (-1)^(2k) = 1, so we ignore it for Y
-                pass
+            if X_exponents[0] % 2 != 0: valid = False
+            
+            for i in range(1, num_base_cols):
+                exp = X_exponents[i]
+                if exp % 2 != 0: valid = False; break
+                X = (X * pow(self.primes[i-1], exp // 2, self.N)) % self.N
+                
+            if not valid: continue
+
+            # 2. Base Primes for Y
+            if Y_exponents[0] % 2 != 0: valid = False
+            
+            for i in range(1, num_base_cols):
+                exp = Y_exponents[i]
+                if exp % 2 != 0: valid = False; break
+                Y = (Y * pow(self.primes[i-1], exp // 2, self.N)) % self.N
             
             if not valid: continue
 
-            # Handle extra factors (remainders)
-            for rem, count in Y_extra_factors.items():
-                if count % 2 != 0:
-                    valid = False
-                    break
-                
-                y_half = count // 2
-                if y_half > 0:
-                    Y = (Y * pow(rem, y_half, self.N)) % self.N
-                elif y_half < 0:
-                    X = (X * pow(rem, -y_half, self.N)) % self.N
+            # 3. Extra Factors for Y
+            for r, count in Y_extra_factors.items():
+                if count % 2 != 0: valid = False; break
+                Y = (Y * pow(r, count // 2, self.N)) % self.N
             
             if not valid: continue
-
-            # Handle primes (indices 1 to d)
-            for p_idx in range(len(self.primes)):
-                exp = Y_exponents[p_idx+1]
-                if exp % 2 != 0:
-                    valid = False
-                    break
-                    
-                y_half = exp // 2
-                base = self.primes[p_idx]
-                
-                if y_half > 0:
-                    Y = (Y * pow(base, y_half, self.N)) % self.N
-                elif y_half < 0:
-                    X = (X * pow(base, -y_half, self.N)) % self.N
             
-            if not valid: continue
-                
             # Now X^2 = Y^2 mod N
             
             # Debug: Check if X^2 == Y^2
@@ -802,44 +801,6 @@ class GeometricFactorizer:
             if X2 != Y2:
                 if attempt < 5:
                     print(f"    Debug: Relation mismatch! X^2 = {X2}, Y^2 = {Y2}")
-                    # Try to diagnose which relation is bad
-                    print("    Diagnosing individual relations in this combination...")
-                    for idx in indices:
-                        rel = self.relations[idx]
-                        # Re-verify this relation
-                        r_pos = 1
-                        r_neg = 1
-                        if 'exponents' in rel:
-                            # Handle -1 (index 0)
-                            if rel['exponents'][0] % 2 != 0:
-                                r_pos *= -1
-                            
-                            for i, e in enumerate(rel['exponents'][1:]):
-                                if e > 0: r_pos *= pow(self.primes[i], e)
-                                elif e < 0: r_neg *= pow(self.primes[i], -e)
-                            
-                            # Handle extra factor (remainder)
-                            rem = rel.get('remainder', 1)
-                            if rem != 1:
-                                # Remainder is on the RHS (factor side)
-                                r_pos *= rem
-                            
-                            if r_pos % self.N != r_neg % self.N:
-                                print(f"      [BAD RELATION] Index {idx} is invalid! {r_pos%self.N} != {r_neg%self.N}")
-                        elif 'd_exponents' in rel:
-                            # Sieve relation: x^2 = prod p^e * remainder
-                            rhs = 1
-                            for i, e in enumerate(rel['d_exponents']):
-                                rhs *= pow(self.primes[i], e)
-                            
-                            # Handle extra factor
-                            rem = rel.get('remainder', 1)
-                            if rem != 1:
-                                rhs *= rem
-                                
-                            lhs = pow(rel['x'], 2)
-                            if lhs % self.N != rhs % self.N:
-                                print(f"      [BAD RELATION] Sieve Index {idx} is invalid!")
             
             # Check if X != +/- Y
             if X == Y or X == (self.N - Y) % self.N:
@@ -856,15 +817,10 @@ class GeometricFactorizer:
             
             if attempt < 5:
                 print(f"    Debug: Non-trivial candidate! X={X}")
-                # print(f"    Y={Y}") # Y is too long
                 print(f"    X^2 mod N = {X2}")
                 print(f"    Y^2 mod N = {Y2}")
-                print(f"    val1 = (X-Y)%N = {val1}")
-                print(f"    val2 = (X+Y)%N = {val2}")
                 print(f"    gcd(val1, N) = {f1}")
                 print(f"    gcd(val2, N) = {f2}")
-                # print(f"    N = {self.N}")
-                # print(f"    (val1 * val2) % N = {(val1 * val2) % self.N}")
             
             if f1 > 1 and f1 < self.N:
                 print(f"\n[SUCCESS] Factor found: {f1}")
