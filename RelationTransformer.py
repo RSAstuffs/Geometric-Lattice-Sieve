@@ -121,9 +121,11 @@ class RelationTransformer:
             
         return np.array(coeffs)
 
-    def train(self, basis_matrix, target_coeffs_list, iterations=100):
+    def train(self, basis_matrix, target_coeffs_list, iterations=100, positive=True):
         """
         Train the transformer to mimic the target coefficients using evolutionary strategy.
+        If positive=True, learn to reproduce these patterns (smooth relations).
+        If positive=False, learn to avoid these patterns (partial relations).
         """
         if not target_coeffs_list: return
         
@@ -151,7 +153,13 @@ class RelationTransformer:
                 # Sum log probs
                 for i, idx in enumerate(indices):
                     p = probs[i, int(idx)]
-                    total_log_prob += np.log(p + 1e-10)
+                    if positive:
+                        # Maximize probability of matching target (smooth relations)
+                        total_log_prob += np.log(p + 1e-10)
+                    else:
+                        # Minimize probability of matching target (partial relations - avoid these)
+                        # So we maximize probability of NOT matching
+                        total_log_prob -= np.log(p + 1e-10)
             
             return total_log_prob
 
