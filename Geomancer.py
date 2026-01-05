@@ -857,34 +857,51 @@ class GeometricFactorizer:
                         Y_extra_factors[r] = Y_extra_factors.get(r, 0) + 1
 
             # Calculate X and Y
+            # X_val contains the product of x values from d_exponents relations
+            # X_exponents contains exponents from 'double' type relations
+            
             X = X_val
             Y = 1
             valid = True
             
-            # 1. Base Primes for X
+            # 1. Base Primes for X (from 'double' relations only)
             # Handle -1 (index 0)
-            if X_exponents[0] % 2 != 0: valid = False
+            if X_exponents[0] % 2 != 0: 
+                valid = False
+            else:
+                # If sign bit is odd, multiply X by -1 (i.e., X = N - X)
+                pass  # Actually handled by parity check
             
             for i in range(1, num_base_cols):
                 exp = X_exponents[i]
-                if exp % 2 != 0: valid = False; break
-                X = (X * pow(self.primes[i-1], exp // 2, self.N)) % self.N
+                if exp % 2 != 0: 
+                    valid = False
+                    break
+                if exp > 0:
+                    X = (X * pow(self.primes[i-1], exp // 2, self.N)) % self.N
                 
             if not valid: continue
 
             # 2. Base Primes for Y
-            if Y_exponents[0] % 2 != 0: valid = False
+            if Y_exponents[0] % 2 != 0: 
+                valid = False
             
-            for i in range(1, num_base_cols):
-                exp = Y_exponents[i]
-                if exp % 2 != 0: valid = False; break
-                Y = (Y * pow(self.primes[i-1], exp // 2, self.N)) % self.N
+            if valid:
+                for i in range(1, num_base_cols):
+                    exp = Y_exponents[i]
+                    if exp % 2 != 0: 
+                        valid = False
+                        break
+                    if exp > 0:
+                        Y = (Y * pow(self.primes[i-1], exp // 2, self.N)) % self.N
             
             if not valid: continue
 
             # 3. Extra Factors for Y
             for r, count in Y_extra_factors.items():
-                if count % 2 != 0: valid = False; break
+                if count % 2 != 0: 
+                    valid = False
+                    break
                 Y = (Y * pow(r, count // 2, self.N)) % self.N
             
             if not valid: continue
