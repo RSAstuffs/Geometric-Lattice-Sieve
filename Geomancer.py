@@ -772,36 +772,103 @@ class GeometricFactorizer:
         # Randomized Search for Non-Trivial Factors
         import random
         
-        # Strategy:
-        # 1. Try each kernel basis vector individually.
-        # 2. If that fails, try random linear combinations of basis vectors.
+        # GEOMETRIC DIVINING:
+        # The kernel is a high-dimensional space, but N = p*q means there's
+        # a hidden 2D structure (mod p and mod q). 
+        # We project the kernel onto 2D and search along the "factor directions".
         
         print(f"  Attempting to find non-trivial factors from {len(kernel_basis)} dependencies...")
+        print(f"  Using geometric projection to divine factor directions...")
+        
+        # Project kernel basis to 2D using simple random projection
+        # Each kernel vector becomes a 2D point
+        kernel_dim = len(kernel_basis)
+        
+        # Random projection vectors
+        proj1 = [random.gauss(0, 1) for _ in range(len(valid_indices))]
+        proj2 = [random.gauss(0, 1) for _ in range(len(valid_indices))]
+        
+        # Normalize
+        norm1 = math.sqrt(sum(x*x for x in proj1))
+        norm2 = math.sqrt(sum(x*x for x in proj2))
+        proj1 = [x/norm1 for x in proj1]
+        proj2 = [x/norm2 for x in proj2]
+        
+        # Project each kernel vector
+        kernel_2d = []
+        for kb in kernel_basis:
+            x = sum(kb[i] * proj1[i] for i in range(len(kb)))
+            y = sum(kb[i] * proj2[i] for i in range(len(kb)))
+            kernel_2d.append((x, y))
         
         # We will try up to max_attempts total checks
         max_attempts = 5000
         trivial_count = 0
         
         # Generator to yield masks (linear combinations of kernel basis)
+        # Returns (mask, phase_name, debug_info)
         def dependency_generator():
             # Phase 1: Single basis vectors
             print("  Phase 1: Checking individual basis vectors...")
             for i in range(len(kernel_basis)):
                 mask = [0] * len(kernel_basis)
                 mask[i] = 1
-                yield mask
+                yield mask, "Phase1_Single", f"basis_vector_{i}"
             
-            # Phase 2: Random combinations
-            print("  Phase 2: Checking random combinations...")
+            # Phase 2: Aggressive Geometric search - extensive direction-based combinations
+            print("  Phase 2: Aggressive geometric divination along projected directions...")
+            # Try many more combinations that lie along "rays" from origin in 2D space
+            num_angles = 72  # 5 degree increments for finer resolution
+            max_combine = min(8, len(kernel_basis))  # Try up to 8 vectors per combination
+            
+            for angle_idx in range(num_angles):
+                angle = angle_idx * math.pi / (num_angles // 2)  # Full circle
+                direction = (math.cos(angle), math.sin(angle))
+                
+                # Find kernel vectors that align with this direction
+                scores = []
+                for i, (x, y) in enumerate(kernel_2d):
+                    # Dot product with direction (cosine similarity)
+                    dot = x * direction[0] + y * direction[1]
+                    # Also consider magnitude for ranking
+                    magnitude = math.sqrt(x*x + y*y)
+                    if magnitude > 0:
+                        score = dot / magnitude  # Normalized dot product
+                    else:
+                        score = 0
+                    scores.append((score, i))
+                
+                scores.sort(reverse=True)
+                
+                # Try various combination sizes, prioritizing higher alignment scores
+                for num_combine in range(1, max_combine + 1):
+                    # Try the top N for this combination size
+                    for start_idx in range(min(3, len(scores) - num_combine + 1)):  # Try first 3 starting positions
+                        mask = [0] * len(kernel_basis)
+                        selected_indices = []
+                        for _, idx in scores[start_idx:start_idx + num_combine]:
+                            mask[idx] = 1
+                            selected_indices.append(idx)
+                        yield mask, "Phase2_Geometric", f"angle_{angle_idx*5}deg_top{num_combine}_start{start_idx}"
+            
+            # Phase 3: Random combinations (fallback)
+            print("  Phase 3: Checking random combinations...")
+            rand_counter = 0
             while True:
+                rand_counter += 1
                 mask = [random.randint(0, 1) for _ in range(len(kernel_basis))]
                 if sum(mask) == 0: continue
-                yield mask
+                yield mask, "Phase3_Random", f"random_{rand_counter}"
 
         attempt_counter = 0
-        for mask in dependency_generator():
+        current_phase = ""
+        current_debug = ""
+        
+        for mask, phase, debug_info in dependency_generator():
             attempt_counter += 1
             attempt = attempt_counter
+            current_phase = phase
+            current_debug = debug_info
             if attempt_counter > max_attempts:
                 break
                 
@@ -942,10 +1009,14 @@ class GeometricFactorizer:
             if f1 > 1 and f1 < self.N:
                 print(f"\n[SUCCESS] Factor found: {f1}")
                 print(f"Other factor: {self.N // f1}")
+                print(f"  >>> DIVINED FROM: {current_phase} ({current_debug})")
+                print(f"  >>> Attempt #{attempt_counter}")
                 return
             elif f2 > 1 and f2 < self.N:
                 print(f"\n[SUCCESS] Factor found: {f2}")
                 print(f"Other factor: {self.N // f2}")
+                print(f"  >>> DIVINED FROM: {current_phase} ({current_debug})")
+                print(f"  >>> Attempt #{attempt_counter}")
                 return
         
         print(f"\n[FAILURE] Could not find non-trivial factors after {max_attempts} attempts.")
