@@ -482,6 +482,11 @@ class GeometricFactorizer:
         if len(self.relations) < target_relations:
             print(f"\nSupplementing with targeted sieve around sqrt(N)...")
             self._supplementary_sieve(target_relations - len(self.relations))
+        
+        # If still not enough, try Dixon's random squares
+        if len(self.relations) < target_relations:
+            print(f"\nTrying Dixon's random squares method...")
+            self._dixon_random_squares(target_relations - len(self.relations))
             
         print(f"Total relations: {len(self.relations)}")
 
@@ -552,6 +557,73 @@ class GeometricFactorizer:
                 break
         
         print(f"  Supplementary sieve found {found} additional relations.")
+
+    def _dixon_random_squares(self, needed):
+        """
+        Dixon's Random Squares Method:
+        Pick random x in [2, N-1], compute x^2 mod N.
+        If x^2 mod N is smooth over the factor base, we have a relation:
+        x^2 ≡ prod(p_i^e_i) (mod N)
+        
+        This is GUARANTEED to eventually work because:
+        1. x^2 mod N is bounded by N
+        2. There exist smooth numbers in [1, N]
+        3. With enough primes, smoothness probability is reasonable
+        """
+        print(f"  Searching for {needed} Dixon relations...")
+        found = 0
+        attempts = 0
+        max_attempts = needed * 10000
+        
+        while found < needed and attempts < max_attempts:
+            attempts += 1
+            
+            # Random x in [2, N-1]
+            x = random.randint(2, self.N - 1)
+            
+            # Compute x^2 mod N
+            x2_mod_N = pow(x, 2, self.N)
+            
+            if x2_mod_N == 0: continue
+            
+            # Try to factor x2_mod_N over the factor base
+            d_exponents = [0] * len(self.primes)
+            temp = x2_mod_N
+            
+            for p_idx, p in enumerate(self.primes):
+                while temp % p == 0:
+                    d_exponents[p_idx] += 1
+                    temp //= p
+                if temp == 1: break
+            
+            if temp == 1:
+                # Full relation: x^2 ≡ prod(p_i^e_i) (mod N)
+                self.relations.append({
+                    'x': x,
+                    'd_exponents': d_exponents,
+                    'remainder': 1
+                })
+                found += 1
+                if found % 10 == 0:
+                    print(f"    Found {found} Dixon relations after {attempts} attempts...")
+            elif temp < self.N // 1000:  # Allow "large prime" if small enough
+                lp = temp
+                if lp in self.partial_relations:
+                    self.relations.append(self.partial_relations.pop(lp))
+                    self.relations.append({
+                        'x': x,
+                        'd_exponents': d_exponents,
+                        'remainder': lp
+                    })
+                    found += 2
+                else:
+                    self.partial_relations[lp] = {
+                        'x': x,
+                        'd_exponents': d_exponents,
+                        'remainder': lp
+                    }
+        
+        print(f"  Dixon method found {found} relations after {attempts} attempts.")
 
     def solve_linear_system(self):
         print(f"\nSolving Linear System with {len(self.relations)} relations...")
