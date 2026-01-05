@@ -301,7 +301,17 @@ class GeometricFactorizer:
                     # It doesn't check for squares yet
                     
                     valid_rel = True
-                    # (Verification omitted for speed, relying on construction logic)
+                    
+                    # Check for triviality: If LHS == 1 or RHS == 1, it's a trivial relation
+                    # LHS == 1 means all exponents are 0 (except maybe sign)
+                    # But we want to avoid X=1, which means LHS=1 (since X comes from LHS)
+                    
+                    is_lhs_one = all(e == 0 for e in lhs_vec[1:])
+                    is_rhs_one = all(e == 0 for e in rhs_vec[1:])
+                    
+                    if is_lhs_one or is_rhs_one:
+                        # print("    Debug: Skipping trivial relation (X=1 or Y=1)")
+                        valid_rel = False
                         
                     if valid_rel:
                         self.relations.append({
@@ -686,28 +696,38 @@ class GeometricFactorizer:
         # Randomized Search for Non-Trivial Factors
         import random
         
-        # If kernel is small, try ALL combinations
-        if len(kernel_basis) < 16:
-            print(f"  Small kernel ({len(kernel_basis)}), trying exhaustive search...")
-            max_attempts = 1 << len(kernel_basis)
-            use_exhaustive = True
-        else:
-            print(f"  Large kernel, trying random subsets...")
-            max_attempts = 5000
-            use_exhaustive = False
+        # Strategy:
+        # 1. Try each kernel basis vector individually.
+        # 2. If that fails, try random linear combinations of basis vectors.
         
-        print(f"  Attempting to combine dependencies to find X^2 = Y^2 with X != +/-Y...")
+        print(f"  Attempting to find non-trivial factors from {len(kernel_basis)} dependencies...")
         
+        # We will try up to max_attempts total checks
+        max_attempts = 5000
         trivial_count = 0
         
-        for attempt in range(1, max_attempts + 1):
-            if use_exhaustive:
-                # Generate mask from attempt number
-                mask = [(attempt >> k) & 1 for k in range(len(kernel_basis))]
-            else:
-                # Random mask
+        # Generator to yield masks (linear combinations of kernel basis)
+        def dependency_generator():
+            # Phase 1: Single basis vectors
+            print("  Phase 1: Checking individual basis vectors...")
+            for i in range(len(kernel_basis)):
+                mask = [0] * len(kernel_basis)
+                mask[i] = 1
+                yield mask
+            
+            # Phase 2: Random combinations
+            print("  Phase 2: Checking random combinations...")
+            while True:
                 mask = [random.randint(0, 1) for _ in range(len(kernel_basis))]
-                if sum(mask) == 0: mask[0] = 1
+                if sum(mask) == 0: continue
+                yield mask
+
+        attempt_counter = 0
+        for mask in dependency_generator():
+            attempt_counter += 1
+            attempt = attempt_counter
+            if attempt_counter > max_attempts:
+                break
                 
             # Combine the dependency vectors
             combined_dependency = [0] * len(valid_indices)
@@ -803,6 +823,10 @@ class GeometricFactorizer:
                     print(f"    Debug: Relation mismatch! X^2 = {X2}, Y^2 = {Y2}")
             
             # Check if X != +/- Y
+            # Note: If X^2 = 1, then Y^2 = 1.
+            # If X is a non-trivial sqrt of 1 (i.e. X != 1 and X != -1), we found a factor!
+            # So we ONLY skip if X == Y or X == -Y.
+            
             if X == Y or X == (self.N - Y) % self.N:
                 trivial_count += 1
                 if attempt % 1000 == 0:
@@ -836,10 +860,10 @@ class GeometricFactorizer:
 
 if __name__ == "__main__":
     # Target N provided by user
-    N = 12
+    N = 2021
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
     # Use 700x700 lattice to get more relations
-    factorizer = GeometricFactorizer(N, lattice_dim=700)
+    factorizer = GeometricFactorizer(N, lattice_dim=50)
     factorizer.find_relations()
     factorizer.solve_linear_system()
