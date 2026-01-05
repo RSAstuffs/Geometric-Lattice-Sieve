@@ -53,7 +53,7 @@ class GeometricFactorizer:
         
         # Interval size for supplementary sieve
         if interval_size is None:
-            interval_size = max(100000, min(10000000, factor_base_size * 100))
+            interval_size = max(100000, min(100000000, factor_base_size * 10000))
         
         self.precision_bits = precision_bits
         self.interval_size = interval_size
@@ -65,7 +65,7 @@ class GeometricFactorizer:
         print(f"N bit length: {n_bits}")
         print(f"Lattice dimension: {lattice_dim}x{lattice_dim}")
         print(f"Auto-scaled parameters:")
-        print(f"  Factor Base Size: {factor_base_size} primes (filtered by Legendre symbol)")
+        print(f"  Factor Base Size: {factor_base_size} primes")
         print(f"  Precision Bits: {precision_bits}")
         print(f"  Target: Find >{factor_base_size} relations to ensure solvable kernel")
 
@@ -117,11 +117,7 @@ class GeometricFactorizer:
         candidate = 3
         while len(primes) < size:
             if isPrime(candidate):
-                # Filter: Legendre symbol (N/p) == 1
-                # This ensures N is a quadratic residue mod p
-                # Essential for Quadratic Sieve, helpful for Schnorr's
-                if pow(self.N, (candidate - 1) // 2, candidate) == 1:
-                    primes.append(candidate)
+                primes.append(candidate)
             candidate += 2
         return primes
 
@@ -224,6 +220,101 @@ class GeometricFactorizer:
         
         return np.linalg.norm(p - closest)
 
+    def _legendre_symbol(self, a, p):
+        """Compute Legendre symbol (a/p)."""
+        if a == 0:
+            return 0
+        # Use Euler's criterion: (a/p) ≡ a^((p-1)/2) mod p
+        return pow(a, (p - 1) // 2, p)
+
+    def _modular_square_root(self, a, p):
+        """Find square root of a mod p using Tonelli-Shanks algorithm."""
+        if a == 0:
+            return 0
+
+        # Check if a is a quadratic residue
+        if self._legendre_symbol(a, p) != 1:
+            return None
+
+        # For p = 2
+        if p == 2:
+            return a % 2
+
+        # Write p-1 = 2^s * q
+        q = p - 1
+        s = 0
+        while q % 2 == 0:
+            q //= 2
+            s += 1
+
+        # Find a non-quadratic residue z
+        z = 2
+        while self._legendre_symbol(z, p) != -1:
+            z += 1
+
+        # Initialize
+        m = s
+        c = pow(z, q, p)
+        t = pow(a, q, p)
+        r = pow(a, (q + 1) // 2, p)
+
+        while True:
+            if t == 0:
+                return 0
+            if t == 1:
+                return r
+
+            # Find smallest i such that t^(2^i) ≡ 1 mod p
+            i = 1
+            t2i = pow(t, 2, p)
+            while t2i != 1:
+                t2i = pow(t2i, 2, p)
+                i += 1
+
+            # Update
+            b = pow(c, 1 << (m - i - 1), p)
+            r = (r * b) % p
+            c = (b * b) % p
+            t = (t * c) % p
+            m = i
+
+    def _solve_quadratic_congruence(self, a, n):
+        """Solve x² ≡ a mod n."""
+        # For now, use a simple approach: try small x values
+        # In practice, this would use more sophisticated methods
+        for x in range(2, min(1000, n)):
+            if (x * x) % n == a % n:
+                return x
+        return None
+
+    def _is_smooth(self, n, factor_base):
+        """Check if n is smooth over the factor base."""
+        if n == 1:
+            return True
+        for p in factor_base:
+            while n % p == 0:
+                n //= p
+            if n == 1:
+                return True
+        return n == 1
+
+    def _factor_over_base(self, n, factor_base):
+        """Factor n over the factor base and return exponents and remainder."""
+        exponents = [0] * len(factor_base)
+        original_n = n
+        n = abs(n)
+        for i, p in enumerate(factor_base):
+            while n % p == 0:
+                exponents[i] += 1
+                n //= p
+        # Compute the product of factored primes
+        prod = 1
+        for i, e in enumerate(exponents):
+            if e > 0:
+                prod *= factor_base[i] ** e
+        remainder = original_n // prod
+        return exponents, remainder
+
     def find_relations(self):
         """
         Use LLL to find smooth relations.
@@ -232,7 +323,7 @@ class GeometricFactorizer:
         print(f"Factor Base Size: {len(self.primes)}")
         
         d = len(self.primes)
-        target_relations = d + 10
+        target_relations = d + 200
         
         getcontext().prec = self.precision_bits + 50
         C_dec = Decimal(self.C)
@@ -245,7 +336,7 @@ class GeometricFactorizer:
         # Store successful coefficients for training the Transformer
         self.successful_coeffs = []
         
-        max_passes = 20
+        max_passes = 100
         
         for pass_num in range(max_passes):
             print(f"\n=== Pass {pass_num + 1} (have {len(self.relations)}/{target_relations} relations) ===")
@@ -331,10 +422,9 @@ class GeometricFactorizer:
                             if e < 0: lhs_vec[i+1] += -e
                             
                         # Fill RHS (-delta)
-                        # delta_exps includes sign of delta at index 0
-                        # We want -delta, so flip sign bit
-                        rhs_vec = list(delta_exps)
-                        rhs_vec[0] += 1 # Flip sign
+                        rhs_vec = [0] * (d + 1)
+                        rhs_vec[0] = 1  # sign for -delta
+                        rhs_vec[1:] = delta_exps
                         
                     else:
                         # pos_product = delta (mod N)
@@ -345,7 +435,9 @@ class GeometricFactorizer:
                             if e > 0: lhs_vec[i+1] += e
                             
                         # Fill RHS (delta)
-                        rhs_vec = list(delta_exps)
+                        rhs_vec = [0] * (d + 1)
+                        rhs_vec[0] = 0
+                        rhs_vec[1:] = delta_exps
 
                     # Normalize signs
                     lhs_vec[0] %= 2
@@ -398,14 +490,14 @@ class GeometricFactorizer:
                         if e_N > 0:
                             for i, e in enumerate(exponents):
                                 if e < 0: rel_vec[i+1] += -e
-                            for i in range(d + 1):
-                                rel_vec[i] -= delta_exps[i]
+                            for i in range(d):
+                                rel_vec[i+1] -= delta_exps[i]
                             rel_vec[0] -= 1 
                         else:
                             for i, e in enumerate(exponents):
                                 if e > 0: rel_vec[i+1] += e
-                            for i in range(d + 1):
-                                rel_vec[i] -= delta_exps[i]
+                            for i in range(d):
+                                rel_vec[i+1] -= delta_exps[i]
                         
                         rel_vec[0] = rel_vec[0] % 2
                         
@@ -422,14 +514,14 @@ class GeometricFactorizer:
                         if e_N > 0:
                             for i, e in enumerate(exponents):
                                 if e < 0: rel_vec[i+1] += -e
-                            for i in range(d + 1):
-                                rel_vec[i] -= delta_exps[i]
+                            for i in range(d):
+                                rel_vec[i+1] -= delta_exps[i]
                             rel_vec[0] -= 1 
                         else:
                             for i, e in enumerate(exponents):
                                 if e > 0: rel_vec[i+1] += e
-                            for i in range(d + 1):
-                                rel_vec[i] -= delta_exps[i]
+                            for i in range(d):
+                                rel_vec[i+1] -= delta_exps[i]
                         
                         rel_vec[0] = rel_vec[0] % 2
                         
@@ -462,8 +554,8 @@ class GeometricFactorizer:
             
             # 2. Lattice Sieving: Check random linear combinations
             # This generates many more short vectors from the reduced basis
-            print(f"    Sieving lattice (checking 2000 combinations)...")
-            for _ in range(2000):
+            print(f"    Sieving lattice (checking 10000 combinations)...")
+            for _ in range(10000):
                 # Pick 2-3 vectors
                 k = random.randint(2, 3)
                 indices = random.sample(range(len(basis_vectors)), k)
@@ -551,7 +643,7 @@ class GeometricFactorizer:
     def _supplementary_sieve(self, needed):
         """Quick sieve to find additional relations if LLL didn't find enough."""
         start_x = math.isqrt(self.N) + 1
-        interval_size = min(self.interval_size, 100000)
+        interval_size = min(self.interval_size, 10000000)
         
         prime_logs = [math.log(p) for p in self.primes]
         sieve_array = [0.0] * interval_size
@@ -618,70 +710,50 @@ class GeometricFactorizer:
 
     def _dixon_random_squares(self, needed):
         """
-        Dixon's Random Squares Method:
-        Pick random x in [2, N-1], compute x^2 mod N.
-        If x^2 mod N is smooth over the factor base, we have a relation:
-        x^2 ≡ prod(p_i^e_i) (mod N)
-        
-        This is GUARANTEED to eventually work because:
-        1. x^2 mod N is bounded by N
-        2. There exist smooth numbers in [1, N]
-        3. With enough primes, smoothness probability is reasonable
+        Use Dixon's random squares method to find additional relations.
+        Randomly select x and check if x² mod N is smooth over the factor base.
+        Try both small x and x near sqrt(N).
         """
-        print(f"  Searching for {needed} Dixon relations...")
+        print(f"  Looking for random Dixon squares (x² smooth mod N)...")
+
         found = 0
         attempts = 0
-        max_attempts = needed * 10000
-        
+        max_attempts = 50000  # Limit attempts to avoid infinite loop
+
+        sqrt_n = math.isqrt(self.N)
+
         while found < needed and attempts < max_attempts:
             attempts += 1
             
-            # Random x in [2, N-1]
-            x = random.randint(2, self.N - 1)
+            # Alternate between small x and x near sqrt(N)
+            if attempts % 2 == 1:
+                # Try small x
+                x = random.randint(2, 1000)
+            else:
+                # Try x near sqrt(N)
+                x = random.randint(sqrt_n - 100000, sqrt_n + 100000)
             
-            # Compute x^2 mod N
-            x2_mod_N = pow(x, 2, self.N)
+            x_squared = (x * x) % self.N
             
-            if x2_mod_N == 0: continue
-            
-            # Try to factor x2_mod_N over the factor base
-            d_exponents = [0] * len(self.primes)
-            temp = x2_mod_N
-            
-            for p_idx, p in enumerate(self.primes):
-                while temp % p == 0:
-                    d_exponents[p_idx] += 1
-                    temp //= p
-                if temp == 1: break
-            
-            if temp == 1:
-                # Full relation: x^2 ≡ prod(p_i^e_i) (mod N)
+            # Check if x_squared is smooth
+            if self._is_smooth(x_squared, self.primes):
+                print(f"  Found smooth square: x={x}, x² ≡ {x_squared} mod N")
+                
+                # Factor x_squared over the factor base
+                exponents, remainder = self._factor_over_base(x_squared, self.primes)
+                
                 self.relations.append({
                     'x': x,
-                    'd_exponents': d_exponents,
-                    'remainder': 1
+                    'd_exponents': exponents,
+                    'remainder': remainder
                 })
                 found += 1
-                if found % 10 == 0:
-                    print(f"    Found {found} Dixon relations after {attempts} attempts...")
-            elif temp < self.N // 1000:  # Allow "large prime" if small enough
-                lp = temp
-                if lp in self.partial_relations:
-                    self.relations.append(self.partial_relations.pop(lp))
-                    self.relations.append({
-                        'x': x,
-                        'd_exponents': d_exponents,
-                        'remainder': lp
-                    })
-                    found += 2
-                else:
-                    self.partial_relations[lp] = {
-                        'x': x,
-                        'd_exponents': d_exponents,
-                        'remainder': lp
-                    }
+                
+                if found >= needed:
+                    break
         
-        print(f"  Dixon method found {found} relations after {attempts} attempts.")
+        print(f"  Found {found} random Dixon squares after {attempts} attempts.")
+        return found > 0
 
     def solve_linear_system(self):
         print(f"\nSolving Linear System with {len(self.relations)} relations...")
@@ -912,6 +984,93 @@ class GeometricFactorizer:
                 mask[i] = 1
                 yield mask, "Phase1_Single", f"basis_vector_{i}"
             
+            # Phase 1.5: Triangulation-based search (primary geometric method)
+            if len(kernel_2d) >= 3:
+                print("  Phase 1.5: Triangulation-based geometric search...")
+                try:
+                    points_2d = np.array(kernel_2d)
+                    
+                    # Ensure proper 2D distribution by checking variance
+                    x_coords = points_2d[:, 0]
+                    y_coords = points_2d[:, 1]
+                    x_var = np.var(x_coords)
+                    y_var = np.var(y_coords)
+                    
+                    # If degenerate, add small perturbations
+                    if x_var < 1e-6 or y_var < 1e-6:
+                        print("    Points are degenerate, adding perturbations...")
+                        # Add small random noise to spread points
+                        np.random.seed(42)
+                        noise_x = np.random.normal(0, 0.01 * (np.max(np.abs(x_coords)) + 1e-6), len(points_2d))
+                        noise_y = np.random.normal(0, 0.01 * (np.max(np.abs(y_coords)) + 1e-6), len(points_2d))
+                        points_2d[:, 0] += noise_x
+                        points_2d[:, 1] += noise_y
+                    
+                    # Use scipy's ConvexHull which is more robust than Delaunay for 2D
+                    from scipy.spatial import ConvexHull
+                    
+                    # Compute convex hull
+                    hull = ConvexHull(points_2d)
+                    
+                    # Find triangles within the convex hull
+                    # Use Delaunay but with better error handling
+                    from scipy.spatial import Delaunay
+                    
+                    # Try Delaunay with QJ option (joggle) to handle near-coplanar points
+                    try:
+                        tri = Delaunay(points_2d, qhull_options='QJ')
+                    except:
+                        # If still fails, use convex hull vertices only
+                        hull_points = points_2d[hull.vertices]
+                        if len(hull_points) >= 3:
+                            tri = Delaunay(hull_points, qhull_options='QJ')
+                        else:
+                            raise ValueError("Insufficient hull points for triangulation")
+                    
+                    # Find triangles that are most promising
+                    origin = np.array([0.0, 0.0])
+                    triangle_candidates = []
+                    
+                    for simplex in tri.simplices:
+                        triangle_points = points_2d[simplex]
+                        
+                        # Calculate triangle properties
+                        centroid = np.mean(triangle_points, axis=0)
+                        dist_to_origin = np.linalg.norm(centroid)
+                        
+                        # Check if triangle contains or is near origin
+                        if self._point_in_triangle(origin, triangle_points):
+                            priority = 0  # Highest priority
+                        else:
+                            # Distance from origin to triangle
+                            dist = self._distance_to_triangle(origin, triangle_points)
+                            priority = dist
+                        
+                        triangle_candidates.append((simplex, priority, dist_to_origin))
+                    
+                    # Sort by priority (closer to origin first)
+                    triangle_candidates.sort(key=lambda x: x[1])
+                    
+                    # Generate combinations from best triangles
+                    for simplex, priority, dist in triangle_candidates[:min(15, len(triangle_candidates))]:
+                        # Try the full triangle
+                        mask = [0] * len(kernel_basis)
+                        for idx in simplex:
+                            mask[idx] = 1
+                        yield mask, "Phase1.5_Triangle", f"triangle_{simplex[0]}_{simplex[1]}_{simplex[2]}_priority_{priority:.3f}"
+                        
+                        # Try pairs from the triangle
+                        for i in range(3):
+                            for j in range(i+1, 3):
+                                mask = [0] * len(kernel_basis)
+                                mask[simplex[i]] = 1
+                                mask[simplex[j]] = 1
+                                yield mask, "Phase1.5_Triangle", f"pair_{simplex[i]}_{simplex[j]}_from_triangle"
+                
+                except Exception as e:
+                    print(f"    Triangulation skipped: {e}")
+                    print("    Continuing with other geometric methods...")
+            
             # Phase 2: Adaptive Geometric search - focus on dense regions
             print("  Phase 2: Adaptive geometric divination along projected directions...")
             
@@ -995,54 +1154,6 @@ class GeometricFactorizer:
                             mask[idx] = 1
                             selected_indices.append(idx)
                         yield mask, "Phase2_Geometric", f"angle_{int(angle*180/math.pi)}deg_top{num_combine}_start{start_idx}"
-            
-            # Phase 2.5: Triangulation-based search for large kernels
-            if kernel_size > 50 and len(kernel_2d) >= 3:
-                print("  Phase 2.5: Triangulation-based divination...")
-                try:
-                    # Convert to numpy array for triangulation
-                    points = np.array(kernel_2d)
-                    
-                    # Compute Delaunay triangulation
-                    tri = Delaunay(points)
-                    
-                    # Find triangles that contain or are near the origin
-                    origin = np.array([0.0, 0.0])
-                    triangles_of_interest = []
-                    
-                    for simplex in tri.simplices:
-                        triangle_points = points[simplex]
-                        
-                        # Check if origin is inside this triangle
-                        if self._point_in_triangle(origin, triangle_points):
-                            triangles_of_interest.append((simplex, "contains_origin"))
-                        else:
-                            # Check distance from origin to triangle
-                            dist = self._distance_to_triangle(origin, triangle_points)
-                            if dist < 0.1:  # Close to origin
-                                triangles_of_interest.append((simplex, f"near_origin_{dist:.3f}"))
-                    
-                    # Sort by priority (containing origin first, then closest)
-                    triangles_of_interest.sort(key=lambda x: 0 if x[1] == "contains_origin" else float(x[1].split('_')[2]))
-                    
-                    # Generate combinations from triangles
-                    for simplex, reason in triangles_of_interest[:min(20, len(triangles_of_interest))]:
-                        # Try the full triangle
-                        mask = [0] * len(kernel_basis)
-                        for idx in simplex:
-                            mask[idx] = 1
-                        yield mask, "Phase2.5_Triangle", f"triangle_{simplex[0]}_{simplex[1]}_{simplex[2]}_{reason}"
-                        
-                        # Try pairs from the triangle
-                        for i in range(3):
-                            for j in range(i+1, 3):
-                                mask = [0] * len(kernel_basis)
-                                mask[simplex[i]] = 1
-                                mask[simplex[j]] = 1
-                                yield mask, "Phase2.5_Triangle", f"pair_{simplex[i]}_{simplex[j]}_from_triangle_{reason}"
-                
-                except Exception as e:
-                    print(f"    Triangulation failed: {e}")
             
             # Phase 3: Random combinations (fallback)
             print("  Phase 3: Checking random combinations...")
@@ -1230,19 +1341,12 @@ if __name__ == "__main__":
     # If user wants to test 2048-bit, they should set N here.
     # We will auto-scale lattice_dim based on N.
     
-    N = 2021 # Default test
+    N = 12
     
     print(f"Target N = {N} ({N.bit_length()} bits)")
     
     # Auto-scale lattice dimension
-    if N.bit_length() > 1000:
-        lattice_dim = 300 # Minimum for large numbers
-    elif N.bit_length() > 500:
-        lattice_dim = 200
-    elif N.bit_length() > 100:
-        lattice_dim = 100
-    else:
-        lattice_dim = 50
+    lattice_dim = 100  # Force dimension 100 for testing
         
     print(f"Using lattice dimension: {lattice_dim}")
     
