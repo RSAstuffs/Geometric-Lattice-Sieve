@@ -68,6 +68,41 @@ class GeometricFactorizer:
         print(f"  Factor Base Size: {factor_base_size} primes")
         print(f"  Precision Bits: {precision_bits}")
         print(f"  Target: Find >{factor_base_size} relations to ensure solvable kernel")
+        
+        # Warn and auto-adjust if lattice dimension is too small
+        # Recommended lattice dimensions based on N size:
+        # For reliable factorization, need larger dimensions than README suggests
+        # README values may work in special cases but are not generally sufficient
+        if n_bits < 64:
+            min_lattice_dim = 50
+        elif n_bits < 128:
+            min_lattice_dim = 100
+        elif n_bits < 256:
+            min_lattice_dim = 200
+        elif n_bits < 512:
+            min_lattice_dim = 500
+        elif n_bits < 1024:
+            min_lattice_dim = 2000  # More aggressive for 1024-bit RSA
+        elif n_bits < 2048:
+            min_lattice_dim = 3000  # For 2048-bit RSA, need much larger
+        else:
+            # For very large N (>= 2048 bits), scale aggressively
+            # Formula: roughly n_bits * 1.5 to 2.0 for reliable results
+            min_lattice_dim = max(5000, int(n_bits * 1.5))
+        
+        if lattice_dim < min_lattice_dim:
+            print(f"  [WARNING] Lattice dimension ({lattice_dim}) is too small for {n_bits}-bit N!")
+            print(f"  Recommended minimum: {min_lattice_dim}×{min_lattice_dim}")
+            if n_bits >= 2048:
+                print(f"  For 2048-bit N: 3000-5000 is recommended for reliable factorization.")
+                print(f"  (README suggests 1000, but this only works in special cases)")
+            print(f"  Auto-adjusting to minimum recommended: {min_lattice_dim}")
+            lattice_dim = min_lattice_dim
+            self.lattice_dim = lattice_dim
+            # Recalculate factor base size
+            factor_base_size = lattice_dim - 1
+            self.primes = self._generate_factor_base(factor_base_size)
+            print(f"  Updated: Factor Base Size = {factor_base_size} primes")
 
     def _tonelli_shanks(self, n, p):
         """
@@ -331,10 +366,17 @@ class GeometricFactorizer:
         log_primes = [Decimal(p).ln() for p in self.primes]
         log_N = Decimal(self.N).ln()
         
+        # Store for transformer use
+        self._d = d
+        self._log_primes = log_primes
+        self._log_N = log_N
+        self._C_dec = C_dec
+        
         seen_relations = set()
         
         # Store successful coefficients for training the Transformer
-        self.successful_coeffs = []
+        self.successful_coeffs = []  # Smooth relations (remainder = ±1)
+        self.failed_coeffs = []  # Partial relations (large prime) - learn what NOT to do
         
         max_passes = 100
         
@@ -362,16 +404,21 @@ class GeometricFactorizer:
             print(f"Lattice dimension: {dim}x{dim}")
             print("Running GeometricLLL reduction...")
             lll = GeometricLLL(self.N, basis=B)
-            # Reduced passes for performance (was 10)
-            reduced = lll.run_geometric_reduction(verbose=False, num_passes=1)
+            # Use more passes to find better relations (especially smooth ones)
+            # More passes = better reduction = more likely to find smooth relations
+            num_passes = 3 if pass_num < 5 else 1  # More passes early, fewer later
+            reduced = lll.run_geometric_reduction(verbose=False, num_passes=num_passes)
             
             print("Analyzing reduced basis for relations...")
             
             pass_relations = 0
+            stats_smooth = 0  # Count smooth relations found
+            stats_partial = 0  # Count partial relations found
             
             # Helper to process a vector of exponents
             def process_vector(exponents, coeffs_record=None, basis_snapshot=None):
-                nonlocal pass_relations
+                nonlocal pass_relations, stats_smooth, stats_partial
+                was_smooth = False  # Will be set based on remainder
                 
                 if all(e == 0 for e in exponents): return
                 
@@ -399,7 +446,19 @@ class GeometricFactorizer:
                 # Factor delta
                 delta_exps, remainder = self._factor_over_base(delta, self.primes)
                 
-                if remainder == 1 or remainder == -1: # -1 handled by sign bit in delta_exps
+                # Debug: Track remainder sizes to understand why we're not getting smooth relations
+                if pass_num == 0 and stats_smooth + stats_partial < 100:
+                    abs_remainder = abs(remainder)
+                    if abs_remainder > 1:
+                        # Log some examples of remainders to understand the distribution
+                        if stats_partial % 50 == 0:
+                            print(f"      Example: delta remainder = {abs_remainder} (bits: {abs_remainder.bit_length()})")
+                
+                # Track if this was smooth (remainder = ±1) for transformer learning
+                was_smooth = (remainder == 1 or remainder == -1)
+                
+                if was_smooth:
+                    stats_smooth += 1
                     # Construct DOUBLE-WIDTH relation vector
                     # We want to find a subset where:
                     #   prod(LHS_i) = X^2
@@ -463,9 +522,33 @@ class GeometricFactorizer:
                         # print("    Debug: Skipping trivial relation (X=1 or Y=1)")
                         valid_rel = False
                     
-                    # Check if LHS == RHS (X == Y)
+                    # Check if LHS == RHS (X == Y) - this would make the relation useless
                     if lhs_vec == rhs_vec:
                         valid_rel = False
+                        if stats_smooth < 5:  # Debug first few
+                            print(f"      Rejected: LHS == RHS (would give X == Y)")
+                    
+                    # Check if LHS == -RHS (X == -Y mod N) - would lead to trivial factorization
+                    # This happens when signs differ but exponents are the same
+                    lhs_neg = lhs_vec[:]
+                    lhs_neg[0] = (lhs_neg[0] + 1) % 2  # Flip sign
+                    if lhs_neg == rhs_vec:
+                        valid_rel = False
+                        if stats_smooth < 5:  # Debug first few
+                            print(f"      Rejected: LHS == -RHS (would give X == -Y)")
+                    
+                    # Check if relation is all zeros (completely trivial)
+                    if all(e == 0 for e in full_vec):
+                        valid_rel = False
+                    
+                    # Additional check: Ensure LHS and RHS are actually different
+                    # If they're too similar, the relation won't help
+                    lhs_nonzero = sum(1 for e in lhs_vec[1:] if e != 0)
+                    rhs_nonzero = sum(1 for e in rhs_vec[1:] if e != 0)
+                    if lhs_nonzero == 0 or rhs_nonzero == 0:
+                        valid_rel = False
+                        if stats_smooth < 5:
+                            print(f"      Rejected: LHS or RHS has no non-zero exponents")
                         
                     if valid_rel:
                         self.relations.append({
@@ -474,9 +557,14 @@ class GeometricFactorizer:
                         })
                         pass_relations += 1
                         if coeffs_record is not None and basis_snapshot is not None:
-                            self.successful_coeffs.append((basis_snapshot, coeffs_record))
+                            if was_smooth:
+                                self.successful_coeffs.append((basis_snapshot, coeffs_record))
+                            else:
+                                # Store failed attempts too - learn what NOT to do
+                                self.failed_coeffs.append((basis_snapshot, coeffs_record))
                 
                 elif jacobi_symbol(self.N, abs(remainder)) == 1:
+                    stats_partial += 1
                     # Large Prime Variation: Only accept if we've seen this remainder before
                     # This ensures each extra factor column has at least 2 relations
                     lp = abs(remainder)
@@ -536,8 +624,11 @@ class GeometricFactorizer:
                             'remainder': lp
                         })
                         pass_relations += 2
+                        # Large prime matches are also useful (they become legacy, but still valid)
                         if coeffs_record is not None and basis_snapshot is not None:
-                            self.successful_coeffs.append((basis_snapshot, coeffs_record))
+                            # These are partial relations that matched - store as "failed" pattern
+                            # (we want smooth, not partial)
+                            self.failed_coeffs.append((basis_snapshot, coeffs_record))
 
             # 1. Check basis vectors
             basis_vectors = []
@@ -554,8 +645,10 @@ class GeometricFactorizer:
             
             # 2. Lattice Sieving: Check random linear combinations
             # This generates many more short vectors from the reduced basis
-            print(f"    Sieving lattice (checking 10000 combinations)...")
-            for _ in range(10000):
+            # Increase combinations if we're not finding enough relations overall
+            num_combinations = 20000 if len(self.relations) < target_relations // 2 else 10000
+            print(f"    Sieving lattice (checking {num_combinations} combinations)...")
+            for _ in range(num_combinations):
                 # Pick 2-3 vectors
                 k = random.randint(2, 3)
                 indices = random.sample(range(len(basis_vectors)), k)
@@ -573,9 +666,20 @@ class GeometricFactorizer:
                 process_vector(new_vec, coeffs, reduced_snapshot)
             
             print(f"Pass {pass_num + 1}: Found {pass_relations} new relations (total: {len(self.relations)})")
+            if pass_num == 0 or pass_relations > 0:
+                print(f"  Statistics: {stats_smooth} smooth (remainder=±1), {stats_partial} partial (large prime)")
             
-            if len(self.relations) >= target_relations:
-                break
+            # If we're not finding smooth relations after several passes, run sieve early
+            # Smooth relations are critical - without them we only get legacy relations
+            non_legacy_count = sum(1 for r in self.relations 
+                                  if ('type' in r and r['type'] == 'double') or 'd_exponents' in r)
+            
+            # After 3 passes, if we have < 10 smooth relations, run sieve to get usable relations
+            if pass_num >= 3 and stats_smooth < 10 and non_legacy_count < 20:
+                print(f"  [WARNING] Very few smooth relations found ({stats_smooth} this pass).")
+                print(f"  Running supplementary sieve early to find usable relations...")
+                needed = max(50, target_relations - len(self.relations))
+                self._supplementary_sieve(min(needed, 100))  # Limit to avoid long waits
             
             if len(self.relations) >= target_relations:
                 print(f"Target reached! Have {len(self.relations)} relations > {d} primes.")
@@ -583,33 +687,90 @@ class GeometricFactorizer:
         
         print(f"Found {len(self.relations)} relations from LLL passes.")
         
+        # Count relation types
+        double_count = sum(1 for r in self.relations if 'type' in r and r['type'] == 'double')
+        sieve_count = sum(1 for r in self.relations if 'd_exponents' in r)
+        legacy_count = sum(1 for r in self.relations if 'exponents' in r and 'type' not in r)
+        print(f"  Relation breakdown: {double_count} double, {sieve_count} sieve, {legacy_count} legacy")
+        
+        # Store the last reduced basis for transformer use
+        self.last_reduced_basis = None
+        if 'reduced' in locals():
+            self.last_reduced_basis = reduced
+        
         # --- Transformer Learning & Divining ---
-        if len(self.successful_coeffs) > 0:
-            print(f"\nTraining Transformer on {len(self.successful_coeffs)} successful patterns...")
-            # Initialize model
-            # input_dim is d + 1 (dimension of lattice vectors)
-            model = RelationTransformer(d + 1, model_dim=64, num_heads=4, num_layers=2)
+        # Count smooth relations needed
+        d = self._d  # Use stored dimension
+        smooth_count = sum(1 for r in self.relations 
+                          if ('type' in r and r['type'] == 'double') or 
+                             ('d_exponents' in r and r.get('remainder', 1) == 1))
+        min_smooth_needed = max(50, d // 2)  # Need enough smooth relations
+        
+        # Train transformer on both successful (smooth) and failed (partial) attempts
+        total_training_samples = len(self.successful_coeffs) + len(self.failed_coeffs)
+        
+        if total_training_samples > 0:
+            print(f"\n=== Transformer Learning & Divining ===")
+            print(f"Training on {len(self.successful_coeffs)} smooth + {len(self.failed_coeffs)} partial patterns...")
+            print(f"Current smooth relations: {smooth_count}/{min_smooth_needed} needed")
             
-            # Train on collected data
+            # Initialize model
+            model = RelationTransformer(self._d + 1, model_dim=64, num_heads=4, num_layers=2)
+            
+            # Train on successful patterns (smooth relations) - these are GOOD
             for i, (basis, coeffs) in enumerate(self.successful_coeffs):
-                # Handle large integers: normalize as object array first (Fixes OverflowError)
                 basis_obj = np.array(basis, dtype=object)
                 max_val = np.max(np.abs(basis_obj))
                 if max_val == 0: max_val = 1
                 basis_mat = (basis_obj / max_val).astype(np.float64)
-
-                model.train(basis_mat, [coeffs], iterations=20)
-                if (i+1) % 10 == 0:
-                    print(f"  Trained on {i+1}/{len(self.successful_coeffs)} samples")
+                # Train with positive reinforcement (these led to smooth relations)
+                model.train(basis_mat, [coeffs], iterations=15, positive=True)
             
-            print("Divining new relations with Transformer...")
+            # Train on failed patterns (partial relations) - learn to AVOID these
+            for i, (basis, coeffs) in enumerate(self.failed_coeffs[:len(self.successful_coeffs)]):  # Balance dataset
+                basis_obj = np.array(basis, dtype=object)
+                max_val = np.max(np.abs(basis_obj))
+                if max_val == 0: max_val = 1
+                basis_mat = (basis_obj / max_val).astype(np.float64)
+                # Train with negative reinforcement (these led to partial relations)
+                # We want to learn to avoid patterns similar to these
+                model.train(basis_mat, [coeffs], iterations=10, positive=False)
+            
+            print(f"  Training complete. Divining smooth relations...")
+            
             # Use the FINAL reduced basis from the last pass
-            reduced_obj = np.array(reduced, dtype=object)
+            if self.last_reduced_basis is not None:
+                reduced_obj = np.array(self.last_reduced_basis, dtype=object)
+            else:
+                # Fallback: rebuild a basis from current relations if needed
+                print(f"  [WARNING] No reduced basis available, rebuilding...")
+                # Re-run one LLL pass to get a basis
+                d = self._d
+                log_primes = self._log_primes
+                log_N = self._log_N
+                C_dec = self._C_dec
+                dim = d + 1
+                B = np.zeros((dim, dim), dtype=object)
+                for i in range(d):
+                    B[i, i] = 1
+                    B[i, d] = int(log_primes[i] * C_dec)
+                B[d, d] = int(log_N * C_dec)
+                lll = GeometricLLL(self.N, basis=B)
+                reduced_obj = np.array(lll.run_geometric_reduction(verbose=False, num_passes=1), dtype=object)
+            
             max_val = np.max(np.abs(reduced_obj))
             if max_val == 0: max_val = 1
             final_basis = (reduced_obj / max_val).astype(np.float64)
             
-            for _ in range(100): 
+            # Keep divining until we have enough smooth relations
+            transformer_attempts = 0
+            max_transformer_attempts = 10000  # Safety limit
+            transformer_found = 0
+            
+            while smooth_count < min_smooth_needed and transformer_attempts < max_transformer_attempts:
+                transformer_attempts += 1
+                
+                # Divine coefficients that might lead to smooth relations
                 pred_coeffs = model.divine_coefficients(final_basis)
                 
                 new_vec = [0] * d
@@ -623,32 +784,98 @@ class GeometricFactorizer:
                 if not is_zero:
                     # Convert to integers
                     new_vec = [int(round(x)) for x in new_vec]
+                    # Process and check if it was smooth
+                    old_smooth = smooth_count
                     process_vector(new_vec, None, None)
+                    # Re-count smooth relations
+                    smooth_count = sum(1 for r in self.relations 
+                                      if ('type' in r and r['type'] == 'double') or 
+                                         ('d_exponents' in r and r.get('remainder', 1) == 1))
+                    
+                    if smooth_count > old_smooth:
+                        transformer_found += 1
+                        if transformer_found % 10 == 0:
+                            print(f"  Transformer found {transformer_found} smooth relations ({smooth_count}/{min_smooth_needed})...")
+                
+                # Update model with new patterns if we found something
+                if transformer_attempts % 100 == 0 and len(self.successful_coeffs) > len(self.failed_coeffs):
+                    # Retrain periodically with new data
+                    if len(self.successful_coeffs) > 0:
+                        latest_basis = self.successful_coeffs[-1][0]
+                        latest_coeffs = self.successful_coeffs[-1][1]
+                        basis_obj = np.array(latest_basis, dtype=object)
+                        max_val = np.max(np.abs(basis_obj))
+                        if max_val == 0: max_val = 1
+                        basis_mat = (basis_obj / max_val).astype(np.float64)
+                        model.train(basis_mat, [latest_coeffs], iterations=5, positive=True)
             
-            print(f"Transformer phase complete.")
+            if smooth_count >= min_smooth_needed:
+                print(f"  ✓ Transformer found enough smooth relations! ({smooth_count}/{min_smooth_needed})")
+            else:
+                print(f"  Transformer phase complete. Found {transformer_found} smooth relations ({smooth_count}/{min_smooth_needed})")
+        elif len(self.successful_coeffs) == 0:
+            print(f"\n[WARNING] No successful patterns to train transformer on.")
+            print(f"  Need to find at least some smooth relations first.")
         # ---------------------------------------
         
-        # If LLL alone didn't find enough, do a targeted sieve
-        if len(self.relations) < target_relations:
-            print(f"\nSupplementing with targeted sieve around sqrt(N)...")
-            self._supplementary_sieve(target_relations - len(self.relations))
+        # Count non-legacy relations (double + sieve)
+        non_legacy_count = sum(1 for r in self.relations 
+                              if ('type' in r and r['type'] == 'double') or 'd_exponents' in r)
         
-        # If still not enough, try Dixon's random squares
-        if len(self.relations) < target_relations:
-            print(f"\nTrying Dixon's random squares method...")
-            self._dixon_random_squares(target_relations - len(self.relations))
+        # If we don't have enough non-legacy relations, run supplementary methods
+        # Even if we have enough total relations, we need non-legacy ones for factorization
+        min_non_legacy = max(50, d // 2)  # Need at least some non-legacy relations
+        
+        if non_legacy_count < min_non_legacy:
+            needed = max(target_relations - len(self.relations), min_non_legacy - non_legacy_count)
+            print(f"\nNeed more non-legacy relations ({non_legacy_count}/{min_non_legacy}).")
+            print(f"Supplementing with targeted sieve around sqrt(N)...")
+            self._supplementary_sieve(needed)
             
-        print(f"Total relations: {len(self.relations)}")
+            # Re-count after sieve
+            non_legacy_count = sum(1 for r in self.relations 
+                                  if ('type' in r and r['type'] == 'double') or 'd_exponents' in r)
+        
+        # If still not enough non-legacy, try Dixon's random squares
+        if non_legacy_count < min_non_legacy:
+            needed = min_non_legacy - non_legacy_count
+            print(f"\nStill need {needed} more non-legacy relations.")
+            print(f"Trying Dixon's random squares method...")
+            self._dixon_random_squares(needed)
+        
+        # Final count
+        double_count = sum(1 for r in self.relations if 'type' in r and r['type'] == 'double')
+        sieve_count = sum(1 for r in self.relations if 'd_exponents' in r)
+        legacy_count = sum(1 for r in self.relations if 'exponents' in r and 'type' not in r)
+        print(f"\nTotal relations: {len(self.relations)}")
+        print(f"  Final breakdown: {double_count} double, {sieve_count} sieve, {legacy_count} legacy (will be skipped)")
+        
+        # Check if sieve relations have small x values (will lead to X == Y)
+        if sieve_count > 0:
+            sieve_x_values = [r['x'] for r in self.relations if 'd_exponents' in r]
+            small_x_count = sum(1 for x in sieve_x_values if x * x < self.N)
+            if small_x_count == sieve_count:
+                print(f"  [WARNING] All {sieve_count} sieve relations have x² < N!")
+                print(f"  This means x² mod N = x², which will lead to X == Y for all dependencies.")
+                print(f"  SOLUTION: Need relations with larger x values (x² >= N).")
+                print(f"  - Increase lattice dimension to find better relations")
+                print(f"  - Or manually provide relations with larger x values")
+            elif small_x_count > sieve_count // 2:
+                print(f"  [WARNING] {small_x_count}/{sieve_count} sieve relations have x² < N.")
+                print(f"  Many dependencies will be trivial (X == Y).")
 
     def _supplementary_sieve(self, needed):
         """Quick sieve to find additional relations if LLL didn't find enough."""
+        print(f"  Starting supplementary sieve (target: {needed} relations)...")
         start_x = math.isqrt(self.N) + 1
-        interval_size = min(self.interval_size, 10000000)
+        # Use a reasonable interval - not too large to avoid long waits
+        interval_size = min(self.interval_size, 5000000)  # Reduced from 10M for faster execution
         
         prime_logs = [math.log(p) for p in self.primes]
         sieve_array = [0.0] * interval_size
         
         # Quick log sieve
+        print(f"  Sieving interval [{start_x}, {start_x + interval_size}]...")
         for p_idx, p in enumerate(self.primes):
             log_p = prime_logs[p_idx]
             roots = self._tonelli_shanks(self.N, p)
@@ -657,12 +884,14 @@ class GeometricFactorizer:
                 for i in range(first_i, interval_size, p):
                     sieve_array[i] += log_p
         
-        # Get top candidates
+        # Get top candidates - check more candidates if we need more relations
+        threshold = max(100, needed * 200)  # Check more candidates
         indexed = [(sieve_array[i], i) for i in range(interval_size)]
         indexed.sort(reverse=True)
         
         found = 0
-        for score, i in indexed[:needed * 100]:
+        smooth_found = 0
+        for score, i in indexed[:threshold]:
             x = start_x + i
             val = x * x - self.N
             
@@ -676,13 +905,16 @@ class GeometricFactorizer:
                 if temp == 1: break
             
             if temp == 1:
-                # Full relation - add directly
+                # Full relation (smooth) - add directly as sieve relation
                 self.relations.append({
                     'x': x,
                     'd_exponents': d_exponents,
                     'remainder': 1
                 })
                 found += 1
+                smooth_found += 1
+                if smooth_found <= 5:
+                    print(f"    Found smooth relation: x={x}, x²-N factors completely")
             elif jacobi_symbol(self.N, abs(temp)) == 1:
                 # Partial relation - use Large Prime Variation
                 lp = abs(temp)
@@ -706,13 +938,13 @@ class GeometricFactorizer:
             if found >= needed:
                 break
         
-        print(f"  Supplementary sieve found {found} additional relations.")
+        print(f"  Supplementary sieve found {found} additional relations ({smooth_found} smooth, {found - smooth_found} partial).")
 
     def _dixon_random_squares(self, needed):
         """
         Use Dixon's random squares method to find additional relations.
         Randomly select x and check if x² mod N is smooth over the factor base.
-        Try both small x and x near sqrt(N).
+        Prefer x near sqrt(N) for better diversity.
         """
         print(f"  Looking for random Dixon squares (x² smooth mod N)...")
 
@@ -721,33 +953,77 @@ class GeometricFactorizer:
         max_attempts = 50000  # Limit attempts to avoid infinite loop
 
         sqrt_n = math.isqrt(self.N)
+        n_bits = self.N.bit_length()
+        
+        # Determine appropriate x range based on N size
+        if n_bits < 64:
+            # Small N: can use smaller x values, but still avoid very small ones
+            min_x = max(100, sqrt_n // 100)
+            max_x = sqrt_n * 2
+        elif n_bits < 256:
+            # Medium N: use moderate x values
+            min_x = max(1000, sqrt_n // 100)
+            max_x = sqrt_n * 2
+        else:
+            # Large N: must use x near sqrt(N)
+            min_x = max(10000, sqrt_n // 1000)
+            max_x = sqrt_n + min(sqrt_n // 10, 1000000)
 
         while found < needed and attempts < max_attempts:
             attempts += 1
             
-            # Alternate between small x and x near sqrt(N)
-            if attempts % 2 == 1:
-                # Try small x
-                x = random.randint(2, 1000)
+            # For small N, we can use a wider range
+            # For large N, focus on x near sqrt(N)
+            if n_bits < 128:
+                # Small N: use wider range but avoid very small x
+                if attempts % 5 == 1:
+                    # Occasionally try smaller x (but not too small)
+                    x = random.randint(min_x, sqrt_n // 2)
+                else:
+                    # Mostly use x in upper range
+                    x = random.randint(sqrt_n // 2, max_x)
             else:
-                # Try x near sqrt(N)
-                x = random.randint(sqrt_n - 100000, sqrt_n + 100000)
+                # Large N: focus on x near sqrt(N)
+                range_size = min(sqrt_n // 10, 1000000)
+                x = random.randint(max(min_x, sqrt_n - range_size), min(max_x, sqrt_n + range_size))
             
             x_squared = (x * x) % self.N
             
+            # For very small x, x² mod N = x², which gives similar relations
+            # This leads to X == Y when combining relations
+            # We need x² >= N for proper modular arithmetic
+            x_squared_val = x * x
+            if x_squared_val < self.N:
+                # For small N, we might accept some small x, but limit them
+                n_bits = self.N.bit_length()
+                if n_bits < 32:
+                    # Very small N: accept small x but prefer larger
+                    if x < 10 and attempts % 10 != 1:  # Only 10% of small x
+                        continue
+                elif n_bits < 64:
+                    # Small N: limit very small x
+                    if x < 100 and attempts % 5 != 1:  # Only 20% of very small x
+                        continue
+                else:
+                    # Larger N: skip all x where x² < N
+                    continue
+            
             # Check if x_squared is smooth
             if self._is_smooth(x_squared, self.primes):
-                print(f"  Found smooth square: x={x}, x² ≡ {x_squared} mod N")
-                
                 # Factor x_squared over the factor base
                 exponents, remainder = self._factor_over_base(x_squared, self.primes)
                 
-                self.relations.append({
-                    'x': x,
-                    'd_exponents': exponents,
-                    'remainder': remainder
-                })
-                found += 1
+                # Only accept if remainder is 1 (smooth) or if x is large enough
+                if remainder == 1 or x * x >= self.N:
+                    if found < 5:  # Only print first few
+                        print(f"  Found smooth square: x={x}, x² ≡ {x_squared} mod N")
+                    
+                    self.relations.append({
+                        'x': x,
+                        'd_exponents': exponents,
+                        'remainder': remainder
+                    })
+                    found += 1
                 
                 if found >= needed:
                     break
@@ -782,9 +1058,26 @@ class GeometricFactorizer:
         total_cols = 2 * base_block_size + len(sorted_extras)
         
         print(f"  Matrix size: {len(self.relations)} x {total_cols} (LHS+RHS Base: {2*base_block_size}, Extra: {len(sorted_extras)})")
+        
+        # Count relation types for debugging
+        double_count = sum(1 for r in self.relations if 'type' in r and r['type'] == 'double')
+        sieve_count = sum(1 for r in self.relations if 'd_exponents' in r)
+        legacy_count = sum(1 for r in self.relations if 'exponents' in r and 'type' not in r)
+        print(f"  Relation types: {double_count} double, {sieve_count} sieve, {legacy_count} legacy (skipped)")
+        
+        # WARNING: If we only have legacy relations, we'll skip them all
+        # because legacy relations have X = 1, so we're looking for Y^2 = 1 mod N (Y = ±1, trivial)
+        if double_count == 0 and sieve_count == 0 and legacy_count > 0:
+            print(f"  [WARNING] Only legacy relations found! These are being skipped because")
+            print(f"  they represent 1 = RHS mod N, which always gives X=1 (trivial solutions).")
+            print(f"  Need double or sieve relations for non-trivial factorizations.")
+            print(f"  Consider increasing lattice dimension or improving relation finding.")
 
         M = []
         valid_indices = []
+        
+        # Skip legacy relations by default - they always lead to X=1 (trivial solutions)
+        skip_legacy = True
         
         for idx, rel in enumerate(self.relations):
             row = [0] * total_cols
@@ -798,7 +1091,9 @@ class GeometricFactorizer:
                     continue
                 
                 for i, e in enumerate(vec):
-                    row[i] = abs(e) % 2
+                    # Use e % 2 (not abs) since in GF(2), -1 = 1
+                    # But we want to preserve the sign information correctly
+                    row[i] = e % 2
                     
             elif 'd_exponents' in rel:
                 # Sieve relation: x^2 = prod(p^e) * R
@@ -827,6 +1122,11 @@ class GeometricFactorizer:
                     row[extra_idx] = 1
             
             elif 'exponents' in rel:
+                 # Legacy/Fallback relation - SKIP BY DEFAULT
+                 # These represent 1 = prod(p^e) * R, which always gives X=1 (trivial)
+                 if skip_legacy:
+                     continue  # Skip legacy relations
+                 
                  # Legacy/Fallback relation
                  # Treated as 1 = prod(p^e) * R  =>  1^2 = prod(p^e) * R
                  # LHS = 1 (exponents 0)
@@ -834,7 +1134,8 @@ class GeometricFactorizer:
                  
                  rhs_offset = base_block_size
                  for i, e in enumerate(rel['exponents']):
-                     row[rhs_offset + i] = abs(e) % 2
+                     # Use e % 2 for consistency (in GF(2), -1 = 1)
+                     row[rhs_offset + i] = e % 2
                      
                  r = rel.get('remainder', 1)
                  if r != 1:
@@ -845,6 +1146,16 @@ class GeometricFactorizer:
                 
             M.append(row)
             valid_indices.append(idx)
+        
+        # Check if we have any valid relations after skipping legacy
+        if len(M) == 0:
+            print(f"  [ERROR] No valid relations to use (all were legacy type, which are skipped).")
+            print(f"  Need to find 'double' or 'sieve' relations for factorization.")
+            print(f"  Try:")
+            print(f"    - Increasing lattice dimension")
+            print(f"    - Running more LLL passes")
+            print(f"    - Increasing factor base size")
+            return
             
         # Gaussian Elimination to find Kernel Basis
         matrix = [row[:] for row in M]
@@ -892,8 +1203,26 @@ class GeometricFactorizer:
                     break
             if is_zero:
                 kernel_basis.append(augmented[i][num_cols:])
-                
+        
+        # Verify kernel vectors are correct: they should be in the nullspace
+        # Each kernel vector v should satisfy: M @ v = 0 (mod 2)
         print(f"  Found {len(kernel_basis)} independent dependencies (Kernel size).")
+        
+        # Validate kernel vectors (debug check)
+        if len(kernel_basis) > 0 and len(kernel_basis[0]) == num_rows:
+            # Check first few kernel vectors
+            for idx, kb in enumerate(kernel_basis[:min(3, len(kernel_basis))]):
+                # Compute M @ kb mod 2
+                result = [0] * num_cols
+                for j in range(num_rows):
+                    if kb[j] == 1:
+                        for c in range(num_cols):
+                            result[c] = (result[c] + matrix[j][c]) % 2
+                # Result should be all zeros
+                if any(result):
+                    print(f"  Warning: Kernel vector {idx} may be invalid (M @ v != 0)")
+                elif idx == 0:
+                    print(f"  Verified: Kernel vectors are in nullspace (checked first vector)")
         
         if not kernel_basis:
             print("  No dependencies found.")
@@ -973,6 +1302,12 @@ class GeometricFactorizer:
         else:
             max_attempts = 20000  # More attempts for very large kernels
         trivial_count = 0
+        
+        # Pre-check: Count relation types to optimize dependency generation
+        double_count = sum(1 for r in self.relations if 'type' in r and r['type'] == 'double')
+        sieve_count = sum(1 for r in self.relations if 'd_exponents' in r)
+        legacy_count = sum(1 for r in self.relations if 'exponents' in r and 'type' not in r)
+        has_non_legacy = double_count > 0 or sieve_count > 0
         
         # Generator to yield masks (linear combinations of kernel basis)
         # Returns (mask, phase_name, debug_info)
@@ -1186,6 +1521,17 @@ class GeometricFactorizer:
             indices = [k for k, bit in enumerate(combined_dependency) if bit == 1]
             if not indices: continue
             
+            # Early triviality check: Skip if dependency selects all relations
+            # (selecting all relations often leads to trivial solutions)
+            if len(indices) == len(valid_indices):
+                continue
+            
+            # Skip dependencies that select only 1 relation - these are often trivial
+            # (a single relation by itself rarely gives non-trivial factorization)
+            if len(indices) == 1:
+                trivial_count += 1
+                continue
+            
             # Construct X and Y
             X_val = 1 # Accumulator for explicit X values (from sieve)
             
@@ -1195,11 +1541,17 @@ class GeometricFactorizer:
             
             Y_extra_factors = {}
             
+            # Track relation types in this dependency
+            has_double = False
+            has_sieve = False
+            has_legacy = False
+            
             for idx in indices:
                 real_idx = valid_indices[idx] # Map back to original relations
                 rel = self.relations[real_idx]
                 
                 if 'type' in rel and rel['type'] == 'double':
+                    has_double = True
                     vec = rel['vec']
                     # vec is [LHS..., RHS...]
                     for i in range(num_base_cols):
@@ -1207,8 +1559,10 @@ class GeometricFactorizer:
                         Y_exponents[i] += vec[num_base_cols + i]
                         
                 elif 'd_exponents' in rel:
+                    has_sieve = True
                     # Sieve: x^2 = RHS
-                    X_val = (X_val * rel['x']) % self.N
+                    x_val = rel['x']
+                    X_val = (X_val * x_val) % self.N
                     
                     # RHS exponents
                     for i, e in enumerate(rel['d_exponents']):
@@ -1220,13 +1574,68 @@ class GeometricFactorizer:
                         Y_extra_factors[r] = Y_extra_factors.get(r, 0) + 1
                         
                 elif 'exponents' in rel:
-                    # Legacy: 1 = RHS
+                    has_legacy = True
+                    # Legacy: These represent 1 = prod(p^e) * R
+                    # Problem: X is always 1 for legacy relations, so we can only get trivial solutions
+                    # Try to use the 'x' field if it exists (from large prime matching)
+                    if 'x' in rel and rel['x'] != 1:
+                        X_val = (X_val * rel['x']) % self.N
+                    
                     for i, e in enumerate(rel['exponents']):
                         Y_exponents[i] += e
                     r = rel.get('remainder', 1)
                     if r != 1:
                         Y_extra_factors[r] = Y_extra_factors.get(r, 0) + 1
+            
+            # CRITICAL: If we only have legacy relations and X_val == 1, then X = 1
+            # This means we're looking for Y such that Y^2 = 1 mod N, which gives Y = ±1 (trivial)
+            # Skip these dependencies early - they can NEVER give non-trivial factors
+            if not has_double and not has_sieve and X_val == 1 and all(e == 0 for e in X_exponents):
+                trivial_count += 1
+                # Skip immediately without expensive computation
+                if attempt_counter % 1000 == 0 and attempt_counter <= 5000:
+                    print(f"    Skipping legacy-only dependency (X=1, would give Y=±1)...")
+                continue
 
+            # CRITICAL: For sieve-only dependencies, check if all x values are small
+            # If all x² < N, then x² mod N = x², and combining gives X == Y
+            if has_sieve and not has_double:
+                # Check if all x values in this dependency are small
+                sieve_x_vals = [self.relations[valid_indices[idx]]['x'] 
+                               for idx in indices 
+                               if 'd_exponents' in self.relations[valid_indices[idx]]]
+                if sieve_x_vals:
+                    max_x_squared = max(x * x for x in sieve_x_vals)
+                    if max_x_squared < self.N:
+                        # All x values are small - this will give X == Y
+                        trivial_count += 1
+                        if attempt_counter <= 5:
+                            print(f"    Attempt {attempt_counter}: Skipping (all x values small, x² < N, would give X==Y)")
+                        continue
+            
+            # CRITICAL: If X_exponents == Y_exponents, then X and Y will have the same prime factors
+            # This means X == Y (mod N) after taking square roots, which is trivial
+            # The only exception is if X_val != 1 (from sieve relations), but even then it's likely trivial
+            if X_exponents == Y_exponents:
+                # If X_val == 1 and no extra factors, definitely trivial
+                if X_val == 1 and len(Y_extra_factors) == 0:
+                    trivial_count += 1
+                    continue
+                # Even with X_val != 1, if exponents match, X and Y will be very similar
+                # Skip these early to save computation
+                trivial_count += 1
+                if attempt_counter <= 10:
+                    print(f"    Attempt {attempt_counter}: Skipping (X_exponents == Y_exponents, likely X==Y)")
+                continue
+            
+            # Check if X_exponents is all zeros (X == 1) or Y_exponents is all zeros (Y == 1)
+            if all(e == 0 for e in X_exponents) and X_val == 1:
+                trivial_count += 1
+                continue
+            if all(e == 0 for e in Y_exponents) and len(Y_extra_factors) == 0:
+                trivial_count += 1
+                continue
+            
             # Calculate X and Y
             # X_val contains the product of x values from d_exponents relations
             # X_exponents contains exponents from 'double' type relations
@@ -1279,12 +1688,28 @@ class GeometricFactorizer:
             
             # Now X^2 = Y^2 mod N
             
-            # Debug: Check if X^2 == Y^2
+            # CRITICAL VALIDATION: Verify that the dependency actually gives X^2 = Y^2 mod N
+            # This should always be true if the matrix was constructed correctly,
+            # but we verify it to catch any bugs in the linear algebra
             X2 = pow(X, 2, self.N)
             Y2 = pow(Y, 2, self.N)
             if X2 != Y2:
-                if attempt < 5:
-                    print(f"    Debug: Relation mismatch! X^2 = {X2}, Y^2 = {Y2}")
+                # This should NEVER happen if the matrix is correct!
+                print(f"    [ERROR] Matrix constraint violated! X^2 = {X2}, Y^2 = {Y2}")
+                print(f"    This indicates a bug in matrix construction or dependency application.")
+                print(f"    Dependency: {indices[:min(5, len(indices))]}... (showing first 5 relations)")
+                continue  # Skip invalid relations
+            
+            # Additional triviality checks before expensive GCD
+            # Check if X == 1 or Y == 1 (trivial square roots)
+            if X == 1 or Y == 1:
+                trivial_count += 1
+                continue
+            
+            # Check if X == -1 mod N or Y == -1 mod N
+            if X == (self.N - 1) % self.N or Y == (self.N - 1) % self.N:
+                trivial_count += 1
+                continue
             
             # Check if X != +/- Y
             # Note: If X^2 = 1, then Y^2 = 1.
@@ -1293,8 +1718,16 @@ class GeometricFactorizer:
             
             if X == Y or X == (self.N - Y) % self.N:
                 trivial_count += 1
-                if attempt % 1000 == 0:
-                    print(f"    Attempt {attempt}: Found trivial solution (X={X}, Y={Y})...")
+                # Diagnostic: Track patterns in trivial solutions
+                if attempt <= 10 or (attempt % 1000 == 0 and attempt <= 5000):
+                    # Check if X_exponents == Y_exponents (would explain X == Y)
+                    x_exp_str = str(X_exponents[:min(5, len(X_exponents))])
+                    y_exp_str = str(Y_exponents[:min(5, len(Y_exponents))])
+                    exp_match = (X_exponents == Y_exponents)
+                    print(f"    Attempt {attempt}: Trivial (X={X}, Y={Y}, X_exp==Y_exp={exp_match})")
+                    if attempt <= 5:
+                        print(f"      X_exponents[:5]={x_exp_str}, Y_exponents[:5]={y_exp_str}")
+                        print(f"      X_val={X_val}, has_double={has_double}, has_sieve={has_sieve}")
                 continue
                 
             # Check Factors: gcd(X - Y, N)
@@ -1324,7 +1757,44 @@ class GeometricFactorizer:
                 return
         
         print(f"\n[FAILURE] Could not find non-trivial factors after {max_attempts} attempts.")
-        print(f"Found {trivial_count} trivial solutions.")
+        print(f"Found {trivial_count} trivial solutions (all gave X == Y or X == -Y).")
+        
+        # Provide helpful diagnosis
+        double_count = sum(1 for r in self.relations if 'type' in r and r['type'] == 'double')
+        sieve_count = sum(1 for r in self.relations if 'd_exponents' in r)
+        legacy_count = sum(1 for r in self.relations if 'exponents' in r and 'type' not in r)
+        
+        if double_count == 0 and sieve_count == 0:
+            print(f"\n[DIAGNOSIS] All {legacy_count} relations are 'legacy' type (from large prime variation).")
+            print(f"  Legacy relations have X = 1, so dependencies can only yield Y^2 = 1 mod N.")
+            print(f"  This gives Y = ±1 mod N, which are trivial square roots.")
+            print(f"  SOLUTION: Need to find more 'double' or 'sieve' relations.")
+            print(f"  - Increase lattice dimension to find smoother relations")
+            print(f"  - Run more LLL passes to find relations with remainder = ±1")
+            print(f"  - Check if factor base size is appropriate")
+        else:
+            print(f"\n[DIAGNOSIS] Have {double_count} double + {sieve_count} sieve relations, but all dependencies are trivial.")
+            print(f"  This suggests the relations might be too similar or the kernel structure is problematic.")
+            print(f"  Possible issues:")
+            print(f"  1. Relations might have X_exponents == Y_exponents (leading to X == Y)")
+            print(f"  2. Kernel might only contain symmetric dependencies")
+            print(f"  3. Need more diverse relations")
+            print(f"  SOLUTIONS:")
+            print(f"  - Try increasing lattice dimension for more diverse relations")
+            print(f"  - Increase number of LLL passes")
+            print(f"  - Check if relations are actually distinct")
+            
+            # Sample a few relations to see if they're diverse
+            if len(self.relations) > 0:
+                print(f"\n  Sampling first 3 relations:")
+                for i, rel in enumerate(self.relations[:3]):
+                    if 'type' in rel and rel['type'] == 'double':
+                        vec = rel['vec']
+                        lhs = vec[:len(vec)//2]
+                        rhs = vec[len(vec)//2:]
+                        print(f"    Relation {i}: LHS non-zero={sum(1 for x in lhs if x)}, RHS non-zero={sum(1 for x in rhs if x)}")
+                    elif 'd_exponents' in rel:
+                        print(f"    Relation {i}: Sieve, x={rel.get('x', '?')}, non-zero exponents={sum(1 for x in rel['d_exponents'] if x)}")
 
 if __name__ == "__main__":
     # Target N provided by user
