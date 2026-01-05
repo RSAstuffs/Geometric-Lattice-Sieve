@@ -7,7 +7,7 @@
 Geomancer is a powerful integer factorization tool that successfully factors **RSA-2048** by combining lattice-based relation finding with the blazing-fast GeometricLLL reduction algorithm.
 
 ## Current status of Python implementation
-- On large N, it returns 'failed to find non-trivial factorization', even though a non-trivial is found.
+- On large N, it will return 'failed to find non-trivial factorization'.
 - Dimension needs to be REALLY high to not see this message, and to factor large N.
 - Forks are welcome!!!!!
 
@@ -22,8 +22,8 @@ Note that it won't outright factor every key... yet.
 | RSA-512  | 200×200          | ✅ Factored |
 | RSA-1024 | 500×500          | ✅ Factored |
 | RSA-2048 | 1000×1000        | ✅ **Factored** *|
-*(Under special circumstances, a modulus that had many relations)
 ---
+*(Under special circumstances, a modulus that had many relations)
 
 ## ✨ Features
 
