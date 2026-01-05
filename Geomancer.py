@@ -292,13 +292,38 @@ class GeometricFactorizer:
                     # Normalize sign exponent to 0 or 1
                     rel_vec[0] = rel_vec[0] % 2
                     
-                    self.relations.append({
-                        'x': X_val,
-                        'exponents': rel_vec
-                    })
-                    pass_relations += 1
-                    if coeffs_record is not None and basis_snapshot is not None:
-                        self.successful_coeffs.append((basis_snapshot, coeffs_record))
+                    # Verify relation validity before adding
+                    # We expect: (-1)^rel_vec[0] * prod(p_i ^ rel_vec[i+1]) == 1 (mod N)
+                    check_val = -1 if rel_vec[0] else 1
+                    valid_rel = True
+                    
+                    for i, e in enumerate(rel_vec[1:]):
+                        if e == 0: continue
+                        base = self.primes[i]
+                        if e > 0:
+                            check_val = (check_val * pow(base, e, self.N)) % self.N
+                        else:
+                            try:
+                                inv = pow(base, -1, self.N)
+                                check_val = (check_val * pow(inv, -e, self.N)) % self.N
+                            except ValueError:
+                                # Non-invertible element found - this is actually a factor!
+                                # But for relation building, we can't use it as a standard relation.
+                                valid_rel = False
+                                break
+                    
+                    if valid_rel and check_val != 1:
+                        # Relation is invalid (math error in construction)
+                        valid_rel = False
+                        
+                    if valid_rel:
+                        self.relations.append({
+                            'x': X_val,
+                            'exponents': rel_vec
+                        })
+                        pass_relations += 1
+                        if coeffs_record is not None and basis_snapshot is not None:
+                            self.successful_coeffs.append((basis_snapshot, coeffs_record))
                 
                 elif jacobi_symbol(self.N, abs(remainder)) == 1:
                     # Large Prime Variation: Only accept if we've seen this remainder before
@@ -721,6 +746,11 @@ class GeometricFactorizer:
                     Y_extra_factors[rem] = Y_extra_factors.get(rem, 0) + 1
             
             # Compute Y = product(p^(exp/2)) mod N
+            # We split exponents into positive and negative to avoid modular inverses
+            # X^2 * (neg_factors) = (pos_factors)
+            # X_new = X * sqrt(neg_factors)
+            # Y_new = sqrt(pos_factors)
+            
             Y = 1
             valid = True
             
@@ -731,13 +761,19 @@ class GeometricFactorizer:
                 # (-1)^(2k) = 1, so we ignore it for Y
                 pass
             
-            # Handle extra factors
+            if not valid: continue
+
+            # Handle extra factors (remainders)
             for rem, count in Y_extra_factors.items():
                 if count % 2 != 0:
                     valid = False
                     break
-                # Add to Y: rem^(count/2)
-                Y = (Y * pow(rem, count // 2, self.N)) % self.N
+                
+                y_half = count // 2
+                if y_half > 0:
+                    Y = (Y * pow(rem, y_half, self.N)) % self.N
+                elif y_half < 0:
+                    X = (X * pow(rem, -y_half, self.N)) % self.N
             
             if not valid: continue
 
@@ -749,21 +785,12 @@ class GeometricFactorizer:
                     break
                     
                 y_half = exp // 2
-                
                 base = self.primes[p_idx]
-                if y_half < 0:
-                    # Handle negative exponent: modular inverse
-                    try:
-                        base = pow(base, -1, self.N)
-                        y_half = -y_half
-                    except ValueError:
-                        # Base is not invertible -> gcd(base, N) > 1 -> Factor found!
-                        f = GCD(base, self.N)
-                        print(f"\n[SUCCESS] Factor found during inversion: {f}")
-                        print(f"Other factor: {self.N // f}")
-                        return
                 
-                Y = (Y * pow(base, y_half, self.N)) % self.N
+                if y_half > 0:
+                    Y = (Y * pow(base, y_half, self.N)) % self.N
+                elif y_half < 0:
+                    X = (X * pow(base, -y_half, self.N)) % self.N
             
             if not valid: continue
                 
